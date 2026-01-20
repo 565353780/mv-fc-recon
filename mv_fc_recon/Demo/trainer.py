@@ -36,7 +36,7 @@ def demo():
         mesh=gen_mesh_file_path,
         resolution=128,
         device=device,
-        num_iterations=200,
+        num_iterations=120,
         log_interval=10,
         log_dir=log_dir,
     )

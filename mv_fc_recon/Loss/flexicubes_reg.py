@@ -1,21 +1,11 @@
-"""
-FlexiCubes 专用正则化损失函数
-
-FlexiCubes 的 SDF 表示与传统 SDF（如 NeuS、NeuralAngelo）有本质区别：
-1. FlexiCubes 的 SDF 只需要符号正确（正=外部，负=内部），不需要是真正的距离场
-2. 强制 ||∇SDF|| = 1 的 Eikonal 约束对 FlexiCubes 是错误的
-3. 基于 Hessian 的曲率约束在离散网格上会放大噪声
-
-本文件提供适合 FlexiCubes 的正则化方法。
-"""
-
 import torch
-from typing import Dict, Optional
 
 
 def sdf_smoothness_loss(
     sdf: torch.Tensor,
     grid_edges: torch.Tensor,
+    mode: str = 'adaptive',
+    threshold: float = 0.1,
 ) -> torch.Tensor:
     """SDF 平滑正则化：惩罚相邻网格点 SDF 差异过大
 
@@ -26,31 +16,67 @@ def sdf_smoothness_loss(
     Args:
         sdf: [N] SDF 网格值
         grid_edges: [E, 2] 边索引
+        mode: 平滑模式
+            - 'l2': 简单 L2 平滑，惩罚所有差异
+            - 'adaptive': 自适应平滑，只惩罚超过阈值的差异
+            - 'huber': Huber loss，对大差异使用 L1，小差异使用 L2
+        threshold: adaptive/huber 模式的阈值
 
     Returns:
         loss: 平滑损失
     """
     # 获取边两端的 SDF 值
     sdf_edge = sdf[grid_edges]  # [E, 2]
-    # 计算差异的平方（L2 平滑）
-    diff = (sdf_edge[:, 0] - sdf_edge[:, 1]) ** 2
-    return diff.mean()
+    diff = sdf_edge[:, 0] - sdf_edge[:, 1]  # [E]
+
+    if mode == 'l2':
+        # 简单 L2 平滑
+        loss = (diff ** 2).mean()
+
+    elif mode == 'adaptive':
+        # 自适应平滑：只惩罚超过阈值的差异
+        # 这允许 SDF 有一定的局部变化（用于捕捉几何细节）
+        # 但惩罚过大的变化（噪声）
+        diff_abs = diff.abs()
+        excess = torch.relu(diff_abs - threshold)
+        loss = (excess ** 2).mean()
+
+    elif mode == 'huber':
+        # Huber loss：对大差异使用 L1（线性），小差异使用 L2（二次）
+        # 这对异常值（噪声）更鲁棒
+        diff_abs = diff.abs()
+        quadratic = torch.clamp(diff_abs, max=threshold)
+        linear = diff_abs - quadratic
+        loss = (0.5 * quadratic ** 2 + threshold * linear).mean()
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    return loss
 
 
 def sdf_gradient_smoothness_loss(
     sdf: torch.Tensor,
     grid_edges: torch.Tensor,
     x_nx3: torch.Tensor,
+    mode: str = 'local',
 ) -> torch.Tensor:
-    """SDF 梯度平滑正则化：惩罚梯度变化过大
+    """SDF 梯度平滑正则化：惩罚梯度变化过大（二阶平滑）
 
     与 Eikonal 不同，这里不强制梯度模长为 1，
-    而是惩罚梯度在空间上的变化（二阶平滑）。
+    而是惩罚梯度在空间上的变化。
+
+    这对于保持几何细节同时抑制高频噪声非常有效：
+    - 一阶平滑（sdf_smoothness_loss）会抹平所有细节
+    - 二阶平滑只惩罚"梯度的变化"，允许平滑的斜坡但抑制尖锐振荡
 
     Args:
         sdf: [N] SDF 网格值
         grid_edges: [E, 2] 边索引
         x_nx3: [N, 3] 网格顶点坐标
+        mode: 平滑模式
+            - 'global': 惩罚梯度偏离全局均值（原始实现）
+            - 'local': 惩罚相邻边梯度差异（更好地保持细节）
 
     Returns:
         loss: 梯度平滑损失
@@ -61,16 +87,56 @@ def sdf_gradient_smoothness_loss(
 
     # 边方向和长度
     edge_vec = pos_edge[:, 1] - pos_edge[:, 0]  # [E, 3]
-    edge_len = edge_vec.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [E, 1]
+    edge_len = edge_vec.norm(dim=-1).clamp(min=1e-8)  # [E]
 
     # SDF 沿边方向的梯度
-    grad_along_edge = (sdf_edge[:, 1] - sdf_edge[:, 0]).unsqueeze(-1) / edge_len  # [E, 1]
+    grad_along_edge = (sdf_edge[:, 1] - sdf_edge[:, 0]) / edge_len  # [E]
 
-    # 惩罚梯度的变化（方差）
-    grad_mean = grad_along_edge.mean()
-    grad_var = ((grad_along_edge - grad_mean) ** 2).mean()
+    if mode == 'global':
+        # 惩罚梯度偏离全局均值
+        grad_mean = grad_along_edge.mean()
+        loss = ((grad_along_edge - grad_mean) ** 2).mean()
 
-    return grad_var
+    elif mode == 'local':
+        # 惩罚相邻顶点的梯度差异
+        # 为每个顶点计算其所有出边的平均梯度
+        device = sdf.device
+        num_vertices = sdf.shape[0]
+
+        # 累加每个顶点的梯度和
+        grad_sum = torch.zeros(num_vertices, device=device)
+        grad_count = torch.zeros(num_vertices, device=device)
+
+        # 边的起点和终点
+        src_idx = grid_edges[:, 0]  # [E]
+        dst_idx = grid_edges[:, 1]  # [E]
+
+        # 对于每条边，将梯度累加到两个端点
+        grad_sum.scatter_add_(0, src_idx, grad_along_edge)
+        grad_sum.scatter_add_(0, dst_idx, -grad_along_edge)  # 反向边梯度取反
+        grad_count.scatter_add_(0, src_idx, torch.ones_like(grad_along_edge))
+        grad_count.scatter_add_(0, dst_idx, torch.ones_like(grad_along_edge))
+
+        # 避免除以 0
+        grad_count = grad_count.clamp(min=1)
+
+        # 每个顶点的平均梯度
+        vertex_grad_mean = grad_sum / grad_count  # [N]
+
+        # 计算每条边的梯度与其端点平均梯度的差异
+        src_grad_mean = vertex_grad_mean[src_idx]  # [E]
+        dst_grad_mean = vertex_grad_mean[dst_idx]  # [E]
+
+        # 梯度应该接近端点的平均值
+        diff_src = (grad_along_edge - src_grad_mean) ** 2
+        diff_dst = (-grad_along_edge - dst_grad_mean) ** 2
+
+        loss = (diff_src + diff_dst).mean() / 2
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    return loss
 
 
 def sdf_sign_consistency_loss(
@@ -277,65 +343,3 @@ def mesh_normal_consistency_loss(
     loss = (1 - dot_product).mean()
 
     return loss
-
-
-def compute_flexicubes_regularization(
-    fc_params: Dict,
-    vertices: Optional[torch.Tensor] = None,
-    faces: Optional[torch.Tensor] = None,
-    lambda_sdf_smooth: float = 0.1,
-    lambda_weight_reg: float = 0.01,
-    lambda_mesh_smooth: float = 0.0,
-    lambda_normal_consistency: float = 0.0,
-) -> Dict[str, torch.Tensor]:
-    """计算 FlexiCubes 专用的正则化损失
-
-    Args:
-        fc_params: FlexiCubes 参数字典
-        vertices: [V, 3] 网格顶点（可选，用于网格平滑）
-        faces: [F, 3] 网格面片（可选，用于网格平滑）
-        lambda_sdf_smooth: SDF 平滑权重
-        lambda_weight_reg: 权重正则化权重
-        lambda_mesh_smooth: 网格 Laplacian 平滑权重
-        lambda_normal_consistency: 法线一致性权重
-
-    Returns:
-        losses: 包含各项损失的字典
-    """
-    device = fc_params['sdf'].device
-    losses = {}
-
-    # SDF 平滑损失
-    if lambda_sdf_smooth > 0:
-        losses['sdf_smooth'] = lambda_sdf_smooth * sdf_smoothness_loss(
-            fc_params['sdf'],
-            fc_params['grid_edges'],
-        )
-    else:
-        losses['sdf_smooth'] = torch.tensor(0.0, device=device)
-
-    # 权重正则化损失
-    if lambda_weight_reg > 0:
-        losses['weight_reg'] = lambda_weight_reg * weight_regularization_loss(
-            fc_params['weight'],
-        )
-    else:
-        losses['weight_reg'] = torch.tensor(0.0, device=device)
-
-    # 网格 Laplacian 平滑损失
-    if lambda_mesh_smooth > 0 and vertices is not None and faces is not None:
-        losses['mesh_smooth'] = lambda_mesh_smooth * mesh_laplacian_smoothness_loss(
-            vertices, faces,
-        )
-    else:
-        losses['mesh_smooth'] = torch.tensor(0.0, device=device)
-
-    # 法线一致性损失
-    if lambda_normal_consistency > 0 and vertices is not None and faces is not None:
-        losses['normal_consistency'] = lambda_normal_consistency * mesh_normal_consistency_loss(
-            vertices, faces,
-        )
-    else:
-        losses['normal_consistency'] = torch.tensor(0.0, device=device)
-
-    return losses
