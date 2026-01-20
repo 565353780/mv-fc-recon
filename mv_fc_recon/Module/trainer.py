@@ -16,6 +16,13 @@ from mv_fc_recon.Loss.finite_difference import (
     compute_sdf_gradients,
     trilinear_interpolate_sdf,
 )
+from mv_fc_recon.Loss.flexicubes_reg import (
+    sdf_smoothness_loss,
+    weight_regularization_loss,
+    mesh_laplacian_smoothness_loss,
+    mesh_normal_consistency_loss,
+    compute_flexicubes_regularization,
+)
 from mv_fc_recon.Module.fc_convertor import FCConvertor
 
 
@@ -102,7 +109,6 @@ class Trainer(object):
 
         # 将相机移动到指定设备并预处理目标图像
         target_images = []
-        os.makedirs(log_dir + 'rgb/', exist_ok=True)
         for camera in camera_list:
             camera.to(device=device)
             # 预处理目标图像
@@ -486,8 +492,8 @@ class Trainer(object):
     def sampleSDFPoints(
         fc_params: Dict,
         num_samples: int = 1024,
-        near_surface_ratio: float = 0.5,
-        surface_std: float = 0.01,
+        near_surface_ratio: float = 0.7,  # 从 0.5 增加到 0.7，更多近表面采样
+        surface_std: float = 0.005,      # 从 0.01 降低到 0.005，更靠近表面
     ) -> torch.Tensor:
         """在 SDF 场中采样点用于计算 eikonal 和 curvature loss
 
@@ -563,9 +569,9 @@ class Trainer(object):
         sdf_grid = fc_params['sdf']
         x_nx3 = fc_params['x_nx3']
 
-        # 默认步长为网格间距
+        # 默认步长为网格间距（使用更小的步长以提高精度）
         if eps is None:
-            eps = 2.0 / resolution
+            eps = 1.0 / resolution  # 从 2.0/resolution 改为 1.0/resolution
 
         # 采样点
         if sample_points is None:
@@ -595,23 +601,48 @@ class Trainer(object):
     def fitImagesWithSDFLoss(
         camera_list: List[RGBDCamera],
         mesh: Union[str, trimesh.Trimesh, None] = None,
-        resolution: int = 64,
+        resolution: int = 128,
         device: str = 'cuda:0',
         bg_color: list = [255, 255, 255],
         num_iterations: int = 1000,
-        lr: float = 1e-3,
-        lambda_dev: float = 0.5,
-        lambda_sdf_reg: float = 0.2,
-        lambda_eikonal: float = 0.1,
-        lambda_curvature: float = 5e-4,
-        warm_up_end: int = 500,
-        num_sdf_samples: int = 1024,
+        lr: float = 5e-4,
+        # 渲染权重（主要驱动力，引导网格变化）
+        lambda_render: float = 1.0,         # 渲染损失权重
+        # FlexiCubes 专用正则化（推荐使用）
+        lambda_sdf_smooth: float = 0.1,     # SDF 平滑：惩罚相邻网格点 SDF 差异
+        lambda_weight_reg: float = 0.01,    # 权重正则化：约束 alpha/beta/gamma
+        lambda_mesh_smooth: float = 0.0,    # 网格 Laplacian 平滑（可选）
+        lambda_normal_consistency: float = 0.0,  # 法线一致性（可选）
+        lambda_dev: float = 0.5,            # FlexiCubes 可展性正则化
+        # 传统 SDF 约束（不推荐用于 FlexiCubes，默认关闭）
+        lambda_eikonal: float = 0.0,        # Eikonal 约束：不适用于 FlexiCubes！
+        lambda_curvature: float = 0.0,      # 曲率约束：不适用于 FlexiCubes！
+        lambda_sdf_reg: float = 0.0,        # 原始 SDF 边缘约束（BCE 版本，不稳定）
+        # 其他参数
+        num_sdf_samples: int = 1024,        # SDF 采样点数（仅用于传统 SDF 约束）
         log_interval: int = 10,
         log_dir: str = './output/',
     ) -> trimesh.Trimesh:
-        """通过多视角图像拟合 FlexiCubes 参数，包含 eikonal 和 curvature loss
+        """通过多视角图像拟合 FlexiCubes 参数
 
-        参考: neural-angelo/neural_angelo/Module/trainer.py
+        ⚠️ 重要说明：FlexiCubes 的 SDF 与传统 SDF（NeuS、NeuralAngelo）有本质区别！
+
+        FlexiCubes 的 SDF 特点：
+        1. 只需要符号正确（正=外部，负=内部），不需要是真正的距离场
+        2. SDF 值的尺度是任意的，不需要满足 ||∇SDF|| = 1
+        3. 表面位置由 SDF 零交叉点决定，而非 SDF 值本身
+
+        因此：
+        - ❌ Eikonal loss（强制 ||∇SDF|| = 1）会导致 SDF 振荡，产生噪声
+        - ❌ 基于 Hessian 的 curvature loss 在离散网格上会放大噪声
+        - ✅ SDF 平滑正则化：惩罚相邻网格点 SDF 差异过大
+        - ✅ 权重正则化：约束 FlexiCubes 的 alpha/beta/gamma 权重
+        - ✅ 网格 Laplacian 平滑：直接在提取的网格顶点上平滑
+        - ✅ 法线一致性：惩罚相邻面片法线差异过大
+
+        训练策略：
+        - Render loss 作为主要驱动力，引导网格向目标图像对齐
+        - FlexiCubes 专用正则化确保表面平滑
 
         Args:
             camera_list: 相机列表，每个相机应包含 rgb_image 属性
@@ -621,18 +652,34 @@ class Trainer(object):
             bg_color: 背景颜色
             num_iterations: 迭代次数
             lr: 学习率
-            lambda_dev: developability 正则化权重
-            lambda_sdf_reg: SDF 边缘正则化权重
-            lambda_eikonal: eikonal loss 权重
-            lambda_curvature: curvature loss 初始权重
-            warm_up_end: curvature loss warm-up 结束迭代数
-            num_sdf_samples: SDF 采样点数
+            lambda_render: 渲染损失权重（主要驱动力）
+            lambda_sdf_smooth: SDF 平滑权重（推荐 0.1-0.5）
+            lambda_weight_reg: 权重正则化权重（推荐 0.01-0.1）
+            lambda_mesh_smooth: 网格 Laplacian 平滑权重（可选，推荐 0.0-0.1）
+            lambda_normal_consistency: 法线一致性权重（可选，推荐 0.0-0.1）
+            lambda_dev: FlexiCubes developability 正则化权重
+            lambda_eikonal: eikonal loss 权重（⚠️ 不推荐用于 FlexiCubes，默认 0）
+            lambda_curvature: curvature loss 权重（⚠️ 不推荐用于 FlexiCubes，默认 0）
+            lambda_sdf_reg: 原始 SDF 边缘正则化权重（⚠️ BCE 版本不稳定，默认 0）
+            num_sdf_samples: SDF 采样点数（仅用于传统 SDF 约束）
             log_interval: 日志打印间隔
             log_dir: TensorBoard 日志目录
 
         Returns:
             拟合后的 mesh
         """
+        # 警告：如果用户启用了不适合 FlexiCubes 的 loss
+        if lambda_eikonal > 0:
+            print('[WARNING] Eikonal loss is NOT suitable for FlexiCubes!')
+            print('         FlexiCubes SDF does not need ||∇SDF|| = 1.')
+            print('         This may cause noisy surfaces. Consider setting lambda_eikonal=0.')
+        if lambda_curvature > 0:
+            print('[WARNING] Hessian-based curvature loss is NOT suitable for FlexiCubes!')
+            print('         This may amplify noise on discrete grids. Consider setting lambda_curvature=0.')
+        if lambda_sdf_reg > 0:
+            print('[WARNING] BCE-based SDF regularization may be unstable.')
+            print('         Consider using lambda_sdf_smooth instead.')
+
         # 创建 FlexiCubes 参数
         fc_params = FCConvertor.createFC(mesh, resolution, device)
         if fc_params is None:
@@ -640,7 +687,6 @@ class Trainer(object):
 
         # 将相机移动到指定设备并预处理目标图像
         target_images = []
-        os.makedirs(log_dir + 'rgb/', exist_ok=True)
         for camera in camera_list:
             camera.to(device=device)
             target_rgb = camera.image
@@ -670,7 +716,7 @@ class Trainer(object):
                         print(f'[WARNING] Failed to export start mesh: {e}')
 
         # 训练循环
-        pbar = tqdm(range(num_iterations), desc='FlexiCubes Optimization with SDF Loss')
+        pbar = tqdm(range(num_iterations), desc='FlexiCubes Optimization')
         for iteration in pbar:
             optimizer.zero_grad()
 
@@ -687,68 +733,109 @@ class Trainer(object):
                     print(f'[WARNING] Mesh too large at iteration {iteration}, skipping...')
                     continue
 
-                # 使用所有相机进行渲染
-                num_cameras = len(camera_list)
-                batch_indices = list(range(num_cameras))
+                # 获取 faces tensor 用于网格平滑
+                faces_tensor = torch.from_numpy(current_mesh.faces).long().to(device)
 
+                # ========== 渲染损失 ==========
                 total_render_loss = 0.0
                 render_rgb_list = []
                 render_idx_list = []
 
-                for idx in batch_indices:
-                    camera = camera_list[idx]
-                    target_rgb = target_images[idx]
+                if lambda_render > 0:
+                    num_cameras = len(camera_list)
+                    batch_indices = list(range(num_cameras))
 
-                    render_dict = NVDiffRastRenderer.renderVertexColor(
-                        mesh=current_mesh,
-                        camera=camera,
-                        bg_color=bg_color,
-                        vertices_tensor=vertices,
-                        enable_antialias=True,
-                    )
+                    for idx in batch_indices:
+                        camera = camera_list[idx]
+                        target_rgb = target_images[idx]
 
-                    render_rgb = render_dict['image']
-                    if render_rgb.max() > 1.0:
-                        render_rgb = render_rgb / 255.0
+                        render_dict = NVDiffRastRenderer.renderVertexColor(
+                            mesh=current_mesh,
+                            camera=camera,
+                            bg_color=bg_color,
+                            vertices_tensor=vertices,
+                            enable_antialias=True,
+                        )
 
-                    if len(render_rgb_list) < 4:
-                        render_rgb_list.append(render_rgb.clone())
-                        render_idx_list.append(idx)
+                        render_rgb = render_dict['image']
+                        if render_rgb.max() > 1.0:
+                            render_rgb = render_rgb / 255.0
 
-                    rgb_loss = ((render_rgb - target_rgb).abs()).mean()
-                    total_render_loss = total_render_loss + rgb_loss
+                        if len(render_rgb_list) < 4:
+                            render_rgb_list.append(render_rgb.clone())
+                            render_idx_list.append(idx)
 
-                avg_render_loss = total_render_loss / len(batch_indices)
+                        rgb_loss = ((render_rgb - target_rgb).abs()).mean()
+                        total_render_loss = total_render_loss + rgb_loss
+
+                    avg_render_loss = total_render_loss / len(batch_indices)
+                else:
+                    avg_render_loss = torch.tensor(0.0, device=device)
+
+                # ========== FlexiCubes 专用正则化（推荐） ==========
 
                 # FlexiCubes developability 正则化损失
                 loss_dev = L_dev.mean() if L_dev is not None and L_dev.numel() > 0 else torch.tensor(0.0, device=device)
 
-                # SDF 边缘正则化损失
-                loss_sdf_reg = computeSDFRegLoss(fc_params['sdf'], grid_edges)
+                # SDF 平滑损失：惩罚相邻网格点 SDF 差异过大
+                if lambda_sdf_smooth > 0:
+                    loss_sdf_smooth = sdf_smoothness_loss(fc_params['sdf'], grid_edges)
+                else:
+                    loss_sdf_smooth = torch.tensor(0.0, device=device)
 
-                # 计算 eikonal 和 curvature loss
-                sdf_losses = Trainer.computeSDFLosses(
-                    fc_params,
-                    num_samples=num_sdf_samples,
-                    training=True,
-                )
-                loss_eikonal = sdf_losses['eikonal']
-                loss_curvature = sdf_losses['curvature']
+                # 权重正则化损失：约束 alpha/beta/gamma 权重
+                if lambda_weight_reg > 0:
+                    loss_weight_reg = weight_regularization_loss(fc_params['weight'])
+                else:
+                    loss_weight_reg = torch.tensor(0.0, device=device)
 
-                # 动态调整 curvature 权重
-                current_curvature_weight = get_curvature_weight(
-                    current_iteration=iteration,
-                    init_weight=lambda_curvature,
-                    warm_up_end=warm_up_end,
-                )
+                # 网格 Laplacian 平滑损失
+                if lambda_mesh_smooth > 0:
+                    loss_mesh_smooth = mesh_laplacian_smoothness_loss(vertices, faces_tensor)
+                else:
+                    loss_mesh_smooth = torch.tensor(0.0, device=device)
 
-                # 总损失
+                # 法线一致性损失
+                if lambda_normal_consistency > 0:
+                    loss_normal_consistency = mesh_normal_consistency_loss(vertices, faces_tensor)
+                else:
+                    loss_normal_consistency = torch.tensor(0.0, device=device)
+
+                # ========== 传统 SDF 约束（不推荐用于 FlexiCubes） ==========
+
+                # 原始 SDF 边缘正则化损失（BCE 版本）
+                if lambda_sdf_reg > 0:
+                    loss_sdf_reg = computeSDFRegLoss(fc_params['sdf'], grid_edges)
+                else:
+                    loss_sdf_reg = torch.tensor(0.0, device=device)
+
+                # Eikonal 和 Curvature loss（不推荐）
+                if lambda_eikonal > 0 or lambda_curvature > 0:
+                    sdf_losses = Trainer.computeSDFLosses(
+                        fc_params,
+                        num_samples=num_sdf_samples,
+                        training=True,
+                    )
+                    loss_eikonal = sdf_losses['eikonal'] if lambda_eikonal > 0 else torch.tensor(0.0, device=device)
+                    loss_curvature = sdf_losses['curvature'] if lambda_curvature > 0 else torch.tensor(0.0, device=device)
+                else:
+                    loss_eikonal = torch.tensor(0.0, device=device)
+                    loss_curvature = torch.tensor(0.0, device=device)
+
+                # ========== 总损失 ==========
                 total_loss = (
-                    avg_render_loss +
+                    # 渲染损失（主要驱动力）
+                    lambda_render * avg_render_loss +
+                    # FlexiCubes 专用正则化（推荐）
                     lambda_dev * loss_dev +
+                    lambda_sdf_smooth * loss_sdf_smooth +
+                    lambda_weight_reg * loss_weight_reg +
+                    lambda_mesh_smooth * loss_mesh_smooth +
+                    lambda_normal_consistency * loss_normal_consistency +
+                    # 传统 SDF 约束（不推荐）
                     lambda_sdf_reg * loss_sdf_reg +
                     lambda_eikonal * loss_eikonal +
-                    current_curvature_weight * loss_curvature
+                    lambda_curvature * loss_curvature
                 )
 
                 # 检查损失是否包含 NaN 或 Inf
@@ -796,10 +883,18 @@ class Trainer(object):
                     writer.add_scalar('Loss/Total', total_loss.item(), iteration)
                     writer.add_scalar('Loss/Render', avg_render_loss.item(), iteration)
                     writer.add_scalar('Loss/Dev', loss_dev.item(), iteration)
-                    writer.add_scalar('Loss/SDF_Reg', loss_sdf_reg.item(), iteration)
-                    writer.add_scalar('Loss/Eikonal', loss_eikonal.item(), iteration)
-                    writer.add_scalar('Loss/Curvature', loss_curvature.item(), iteration)
-                    writer.add_scalar('Weight/Curvature', current_curvature_weight, iteration)
+                    writer.add_scalar('Loss/SDF_Smooth', loss_sdf_smooth.item(), iteration)
+                    writer.add_scalar('Loss/Weight_Reg', loss_weight_reg.item(), iteration)
+                    if lambda_mesh_smooth > 0:
+                        writer.add_scalar('Loss/Mesh_Smooth', loss_mesh_smooth.item(), iteration)
+                    if lambda_normal_consistency > 0:
+                        writer.add_scalar('Loss/Normal_Consistency', loss_normal_consistency.item(), iteration)
+                    if lambda_sdf_reg > 0:
+                        writer.add_scalar('Loss/SDF_Reg', loss_sdf_reg.item(), iteration)
+                    if lambda_eikonal > 0:
+                        writer.add_scalar('Loss/Eikonal', loss_eikonal.item(), iteration)
+                    if lambda_curvature > 0:
+                        writer.add_scalar('Loss/Curvature', loss_curvature.item(), iteration)
 
                     for i, (render_rgb, render_idx) in enumerate(zip(render_rgb_list, render_idx_list)):
                         if render_rgb.dim() == 3 and render_rgb.shape[-1] == 3:
@@ -809,8 +904,8 @@ class Trainer(object):
             pbar.set_postfix({
                 'loss': f'{total_loss.item():.4f}',
                 'render': f'{avg_render_loss.item():.4f}',
-                'eik': f'{loss_eikonal.item():.4f}',
-                'curv': f'{loss_curvature.item():.4f}',
+                'sdf_sm': f'{loss_sdf_smooth.item():.4f}',
+                'dev': f'{loss_dev.item():.4f}',
             })
 
         # 关闭 TensorBoard writer

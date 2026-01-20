@@ -116,7 +116,7 @@ def compute_sdf_gradients_from_grid(
     """
     if eps is None:
         # 默认使用网格间距
-        eps = 2.0 / resolution
+        eps = 1.0 / resolution
 
     # 创建一个基于三线性插值的 SDF 函数
     def sdf_func(points):

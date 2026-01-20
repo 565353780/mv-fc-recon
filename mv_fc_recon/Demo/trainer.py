@@ -25,6 +25,7 @@ def demo():
 
     camera_pkl_file_path = data_folder + 'camera_cpu.pkl'
     gen_mesh_file_path = data_folder + "stage2_192_n_d2_d4_d8_d16.ply"
+    log_dir = data_folder + 'mv-fc-recon/logs/' + getCurrentTime() + '/'
 
     assert os.path.exists(camera_pkl_file_path), f"camera.pkl not found at {camera_pkl_file_path}"
     with open(camera_pkl_file_path, 'rb') as f:
@@ -33,13 +34,12 @@ def demo():
     fitting_mesh = Trainer.fitImagesWithSDFLoss(
         camera_list=camera_list,
         mesh=gen_mesh_file_path,
-        resolution=192,
+        resolution=128,
         device=device,
         num_iterations=200,
-        lr=1e-3,
         log_interval=10,
-        log_dir=data_folder + 'mv-fc-recon/logs/' + getCurrentTime() + '/'
+        log_dir=log_dir,
     )
 
-    fitting_mesh.export(data_folder + 'fc_fitting_mesh.ply')
+    fitting_mesh.export(log_dir + 'fc_fitting_mesh.ply')
     return True

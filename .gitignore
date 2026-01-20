@@ -1,0 +1,7 @@
+# compiled
+__pycache__
+.DS_Store
+
+# output
+logs
+output

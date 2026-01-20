@@ -70,6 +70,10 @@ def get_curvature_weight(
         # Warm-up 阶段：线性增长
         return current_iteration / warm_up_end * init_weight
     else:
-        # Warm-up 之后：根据 coarse-to-fine 级别衰减
-        decay_factor = growth_rate ** (anneal_levels - 1)
-        return init_weight / decay_factor
+        # Warm-up 之后：保持权重不变（不衰减），确保曲率约束持续有效
+        # 如果 curvature loss 持续增长，说明需要更强的约束
+        return init_weight
+        
+        # 可选：如果需要缓慢衰减，可以使用以下代码
+        # decay_factor = 1.0 + (growth_rate ** (anneal_levels - 1) - 1.0) * 0.1
+        # return init_weight / decay_factor
