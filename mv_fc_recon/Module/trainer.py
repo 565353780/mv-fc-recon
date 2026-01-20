@@ -63,11 +63,10 @@ class Trainer(object):
         device: str = 'cuda:0',
         bg_color: list = [255, 255, 255],
         num_iterations: int = 1000,
-        batch_size: int = 8,
-        lr: float = 0.01,
+        lr: float = 1e-3,
         lambda_dev: float = 0.5,
         lambda_sdf_reg: float = 0.2,
-        log_interval: int = 1,
+        log_interval: int = 10,
         log_dir: str = './output/',
     ) -> trimesh.Trimesh:
         """
@@ -82,7 +81,6 @@ class Trainer(object):
             device: 计算设备
             bg_color: 背景颜色
             num_iterations: 迭代次数
-            batch_size: 每次迭代采样的视角数量
             lr: 学习率
             lambda_dev: developability正则化权重
             lambda_sdf_reg: SDF边缘正则化权重
@@ -139,15 +137,13 @@ class Trainer(object):
                 fc_params, training=True
             )
 
-            # 随机采样batch_size个视角
+            # 使用所有相机进行渲染
             num_cameras = len(camera_list)
-            if batch_size >= num_cameras:
-                batch_indices = list(range(num_cameras))
-            else:
-                batch_indices = np.random.choice(num_cameras, batch_size, replace=False).tolist()
+            batch_indices = list(range(num_cameras))
 
             total_render_loss = 0.0
-            first_render_rgb = None  # 保存第一个视角的渲染结果用于TensorBoard
+            render_rgb_list = []  # 保存前4个视角的渲染结果用于TensorBoard
+            render_idx_list = []  # 保存对应的索引
 
             for idx in batch_indices:
                 camera = camera_list[idx]
@@ -163,35 +159,21 @@ class Trainer(object):
                 )
 
                 render_rgb = render_dict['image']  # [H, W, 3]
-                rasterize_output = render_dict['rasterize_output']  # [H, W, 4]
 
                 # 确保渲染结果在[0, 1]范围
                 if render_rgb.max() > 1.0:
                     render_rgb = render_rgb / 255.0
 
-                # 保存第一个视角的渲染结果用于TensorBoard
-                if first_render_rgb is None:
-                    first_render_rgb = render_rgb.clone()
-
-                # 计算mask损失（silhouette loss）
-                # 渲染的mask
-                render_mask = (rasterize_output[..., 3:4] > 0).float()  # [H, W, 1]
-                # 目标mask（假设背景是白色）
-                bg_threshold = 0.95
-                target_mask = (target_rgb.mean(dim=-1, keepdim=True) < bg_threshold).float()  # [H, W, 1]
-
-                # Mask loss (IoU-based)
-                intersection = (render_mask * target_mask).sum()
-                union = render_mask.sum() + target_mask.sum() - intersection
-                mask_loss = 1.0 - intersection / (union + 1e-8)
+                # 保存前4个视角的渲染结果用于TensorBoard
+                if len(render_rgb_list) < 4:
+                    render_rgb_list.append(render_rgb.clone())
+                    render_idx_list.append(idx)
 
                 # RGB loss（只在有效区域计算）
-                valid_mask = render_mask * target_mask
-                rgb_loss = ((render_rgb - target_rgb).abs() * valid_mask).sum() / (valid_mask.sum() * 3 + 1e-8)
+                rgb_loss = ((render_rgb - target_rgb).abs()).mean()
 
                 # 组合渲染损失
-                render_loss = mask_loss + rgb_loss
-                total_render_loss += render_loss
+                total_render_loss = total_render_loss + rgb_loss
 
             # 平均渲染损失
             avg_render_loss = total_render_loss / len(batch_indices)
@@ -211,30 +193,28 @@ class Trainer(object):
             # 更新参数
             optimizer.step()
 
-            # 记录到TensorBoard
-            if writer is not None:
-                # 记录所有loss
-                writer.add_scalar('Loss/Total', total_loss.item(), iteration)
-                writer.add_scalar('Loss/Render', avg_render_loss.item(), iteration)
-                writer.add_scalar('Loss/Dev', loss_dev.item(), iteration)
-                writer.add_scalar('Loss/SDF_Reg', loss_sdf_reg.item(), iteration)
-
-                # 记录渲染的RGB图像（使用第一个batch的渲染结果）
-                if first_render_rgb is not None and len(batch_indices) > 0:
-                    first_idx = batch_indices[0]
-                    render_rgb = first_render_rgb.clone()
-                    if render_rgb.dim() == 3 and render_rgb.shape[-1] == 3:
-                        render_rgb = render_rgb.permute(2, 0, 1)  # [H, W, 3] -> [3, H, W]
-                    writer.add_image(f'Render/Camera_{first_idx}', render_rgb, global_step=iteration)
-
             # 更新进度条
             if iteration % log_interval == 0 or iteration == num_iterations - 1:
-                pbar.set_postfix({
-                    'loss': f'{total_loss.item():.4f}',
-                    'render': f'{avg_render_loss.item():.4f}',
-                    'dev': f'{loss_dev.item():.4f}',
-                    'sdf_reg': f'{loss_sdf_reg.item():.4f}',
-                })
+                # 记录到TensorBoard
+                if writer is not None:
+                    # 记录所有loss
+                    writer.add_scalar('Loss/Total', total_loss.item(), iteration)
+                    writer.add_scalar('Loss/Render', avg_render_loss.item(), iteration)
+                    writer.add_scalar('Loss/Dev', loss_dev.item(), iteration)
+                    writer.add_scalar('Loss/SDF_Reg', loss_sdf_reg.item(), iteration)
+
+                    # 记录渲染的RGB图像（只保存前4张）
+                    for i, (render_rgb, render_idx) in enumerate(zip(render_rgb_list, render_idx_list)):
+                        if render_rgb.dim() == 3 and render_rgb.shape[-1] == 3:
+                            render_rgb = render_rgb.permute(2, 0, 1)  # [H, W, 3] -> [3, H, W]
+                        writer.add_image(f'Render/Camera_{render_idx}', render_rgb, global_step=iteration)
+
+            pbar.set_postfix({
+                'loss': f'{total_loss.item():.4f}',
+                'render': f'{avg_render_loss.item():.4f}',
+                'dev': f'{loss_dev.item():.4f}',
+                'sdf_reg': f'{loss_sdf_reg.item():.4f}',
+            })
 
         # 关闭TensorBoard writer
         if writer is not None:

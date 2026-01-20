@@ -35,7 +35,8 @@ def demo():
         mesh=gen_mesh_file_path,
         resolution=128,
         device=device,
-        log_interval=1,
+        lr=1e-3,
+        log_interval=10,
         log_dir=data_folder + 'mv-fc-recon/logs/' + getCurrentTime() + '/'
     )
 
