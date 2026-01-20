@@ -1,100 +1,264 @@
 import os
-import cv2
 import torch
-import kaolin
-import pickle
 import trimesh
-from typing import Union, List
-from kaolin.ops.conversions import trianglemesh_to_voxelgrid
-
-from camera_control.Module.rgbd_camera import RGBDCamera
-from camera_control.Module.nvdiffrast_renderer import NVDiffRastRenderer
+import warp as wp
+import numpy as np
+from typing import Union, Dict, Optional, Tuple
+from kaolin.ops.conversions import FlexiCubes
 
 from mv_fc_recon.Method.io import loadMeshFile
 
-def demo_render(mesh: trimesh.Trimesh, bg_color=[255, 255, 255]):
+
+# 1. 初始化 Warp
+wp.init()
+
+@wp.kernel
+def compute_sdf_kernel(
+    mesh: wp.uint64,                 # Mesh 句柄
+    query_points: wp.array(dtype=wp.vec3),
+    out_sdf: wp.array(dtype=float),
+    out_gradients: wp.array(dtype=wp.vec3)  # 可选：SDF 梯度（即方向）
+):
+    tid = wp.tid()
+    p = query_points[tid]
+
+    # max_dist 设置为一个足够大的数
+    # MeshQueryPoint 包含: result, face, u, v, sign
+    query_res = wp.mesh_query_point(mesh, p, 1.0e6)
+
+    if query_res.result:
+        # 使用重心坐标计算最近点位置
+        face_idx = query_res.face
+        u = query_res.u
+        v = query_res.v
+        closest_p = wp.mesh_eval_position(mesh, face_idx, u, v)
+
+        # 计算距离 (Unsigned)
+        dist = wp.length(p - closest_p)
+
+        # 使用 query_res.sign 直接获取符号（正数表示外部，负数表示内部）
+        sdf_val = query_res.sign * dist
+
+        out_sdf[tid] = sdf_val
+
+        # 计算方向向量
+        diff = p - closest_p
+
+        # 计算梯度（SDF 的导数就是指向表面的单位向量）
+        if dist > 1e-6:
+            out_gradients[tid] = wp.normalize(diff)
+        else:
+            # 在表面上直接使用法线
+            normal = wp.mesh_eval_face_normal(mesh, face_idx)
+            out_gradients[tid] = normal
+
+    else:
+        # 如果超出 max_dist
+        out_sdf[tid] = 1.0e6
+        out_gradients[tid] = wp.vec3(0.0, 0.0, 0.0)
+
+def compute_gt_sdf_batch(wp_mesh, points: torch.Tensor) -> torch.Tensor:
+    """使用 Warp 计算 GT SDF。
+
+    Args:
+        points: [N, 3] 或 [..., 3] 采样点坐标。
+
+    Returns:
+        sdf: [N] 或 [...] GT SDF 值。
+    """
+    original_shape = points.shape[:-1]
+    points_flat = points.view(-1, 3)
+    num_points = points_flat.shape[0]
+
+    # 准备查询点
+    points_np = points_flat.detach().cpu().numpy().astype(np.float32)
+
+    # 创建 Warp 数组
+    wp_points = wp.array(points_np, dtype=wp.vec3)
+    wp_sdf = wp.zeros(num_points, dtype=float)
+    wp_gradients = wp.zeros(num_points, dtype=wp.vec3)
+
+    # 运行 kernel
+    wp.launch(
+        kernel=compute_sdf_kernel,
+        dim=num_points,
+        inputs=[wp_mesh.id, wp_points, wp_sdf, wp_gradients]
+    )
+
+    # 同步并转换回 PyTorch
+    wp.synchronize()
+    sdf_np = wp_sdf.numpy()
+    sdf = torch.from_numpy(sdf_np).float().to(points.device)
+
+    # 恢复原始形状
+    sdf = sdf.view(*original_shape)
+    return sdf
 
 class FCConvertor(object):
     def __init__(self) -> None:
         return
 
     @staticmethod
+    def meshToSDF(
+        mesh: trimesh.Trimesh,
+        query_points: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        在指定查询点计算mesh的SDF值（使用trimesh的精确计算）
+
+        Args:
+            mesh: trimesh.Trimesh对象
+            query_points: [N, 3] 查询点坐标（可以是任意坐标范围）
+            device: 计算设备
+
+        Returns:
+            sdf: [N] SDF值（内部为负，外部为正）
+        """
+        vertices = mesh.vertices.astype(np.float32)
+        faces = mesh.faces.astype(np.int32).flatten()
+
+        wp_mesh = wp.Mesh(
+            points=wp.array(vertices, dtype=wp.vec3),
+            indices=wp.array(faces, dtype=int)
+        )
+
+        return compute_gt_sdf_batch(wp_mesh, query_points)
+
+    @staticmethod
     def createFC(
-        mesh: Union[str, trimesh.Trimesh],
-        resolution: int=128,
-        device: str='cuda:0',
-    ):
+        mesh: Union[str, trimesh.Trimesh, None] = None,
+        resolution: int = 64,
+        device: str = 'cuda:0',
+        grid_scale: float = 2.0,
+    ) -> Optional[Dict]:
+        """
+        从三角网格创建FlexiCubes参数
+
+        参考: https://github.com/nv-tlabs/FlexiCubes/blob/main/examples/optimization.ipynb
+
+        Args:
+            mesh: 网格文件路径或trimesh对象，如果为None则随机初始化SDF
+            resolution: FlexiCubes分辨率（体素网格分辨率）
+            device: 计算设备
+            grid_scale: 网格缩放因子，确保网格大于目标物体
+
+        Returns:
+            dict包含: fc, sdf, deform, weight, x_nx3, cube_fx8, grid_edges
+        """
         if isinstance(mesh, str):
             if not os.path.exists(mesh):
                 print('[ERROR][FCConvertor::createFC]')
                 print('\t mesh file not exist!')
                 print('\t mesh_file_path:', mesh)
                 return None
-
             mesh = loadMeshFile(mesh)
 
-        fc = kaolin.ops.flexicubes.FlexiCubes(device=device)
-        return fc
+        # 创建FlexiCubes对象
+        fc = FlexiCubes(device=device)
+
+        # 构建体素网格
+        x_nx3, cube_fx8 = fc.construct_voxel_grid(resolution)
+        # x_nx3: [N, 3] 网格顶点坐标，范围[-1, 1]
+        # cube_fx8: [F, 8] 每个立方体的8个顶点索引
+
+        # 放大网格使其大于目标物体（参考官方示例）
+        x_nx3 = x_nx3 * grid_scale
+
+        if mesh is not None:
+            # 直接在x_nx3坐标位置计算SDF值（更精确的方法）
+            # 注意：x_nx3的范围是[-grid_scale, grid_scale]，而mesh已归一化到[-0.9, 0.9]
+            # 所以mesh会在grid范围内
+            sdf_values = FCConvertor.meshToSDF(mesh, x_nx3)
+        else:
+            # 随机初始化SDF（参考官方示例）
+            sdf_values = torch.rand_like(x_nx3[:, 0]) - 0.1
+
+        # 创建可学习参数
+        sdf = torch.nn.Parameter(sdf_values.clone().detach(), requires_grad=True)
+
+        # deform: 顶点位移，形状与x_nx3相同 [N, 3]
+        deform = torch.nn.Parameter(torch.zeros_like(x_nx3), requires_grad=True)
+
+        # weight: FlexiCubes特有的权重
+        # 参考官方示例：weight形状为 [F, 21]
+        # beta: [:, :12] - 12个边的插值权重
+        # alpha: [:, 12:20] - 8个顶点的权重
+        # gamma_f: [:, 20] - 每个立方体的权重
+        num_cubes = cube_fx8.shape[0]
+        weight = torch.nn.Parameter(
+            torch.zeros((num_cubes, 21), dtype=torch.float32, device=device),
+            requires_grad=True
+        )
+
+        # 获取所有边用于正则化损失（参考官方示例）
+        all_edges = cube_fx8[:, fc.cube_edges].reshape(-1, 2)
+        grid_edges = torch.unique(all_edges, dim=0)
+
+        return {
+            'fc': fc,
+            'sdf': sdf,
+            'deform': deform,
+            'weight': weight,
+            'x_nx3': x_nx3,
+            'cube_fx8': cube_fx8,
+            'resolution': resolution,
+            'grid_scale': grid_scale,
+            'grid_edges': grid_edges,
+        }
 
     @staticmethod
-    def fitImages(
-        camera_list: List[RGBDCamera],
-        mesh: Union[str, trimesh.Trimesh],
-        resolution: int=128,
-        device: str='cuda:0',
-        bg_color: list=[255, 255, 255],
-    ) -> trimesh.Trimesh:
-        fc = FCConvertor.createFC(mesh, resolution, device)
+    def extractMesh(
+        fc_params: Dict,
+        training: bool = True,
+    ) -> Tuple[trimesh.Trimesh, torch.Tensor, torch.Tensor]:
+        """
+        从FlexiCubes参数提取三角网格
 
-        for camera in camera_list:
-            camera.to(device=device)
+        参考: https://github.com/nv-tlabs/FlexiCubes/blob/main/examples/optimization.ipynb
 
-        # 你的可学习参数 (SDF值 + 变形权重)
-        # sdf: [Batch, Res, Res, Res]
-        # deform: [Batch, Res, Res, Res, 3] -> 允许网格顶点微调
-        sdf = torch.nn.Parameter(initial_sdf, requires_grad=True) 
-        deform = torch.nn.Parameter(torch.zeros_like(initial_sdf_vec), requires_grad=True)
-        weight = torch.nn.Parameter(torch.zeros(...), requires_grad=True) # FlexiCubes 特有的权重
+        Args:
+            fc_params: createFC返回的参数字典
+            training: 是否处于训练模式（影响L_dev的计算）
 
-        optimizer = torch.optim.Adam([sdf, deform, weight], lr=0.01)
+        Returns:
+            tuple: (mesh, vertices, faces, L_dev)
+                - mesh: trimesh.Trimesh对象
+                - vertices: [V, 3] 顶点tensor（保持梯度）
+                - L_dev: developability损失
+        """
+        fc = fc_params['fc']
+        sdf = fc_params['sdf']
+        deform = fc_params['deform']
+        weight = fc_params['weight']
+        x_nx3 = fc_params['x_nx3']
+        cube_fx8 = fc_params['cube_fx8']
+        resolution = fc_params['resolution']
+        grid_scale = fc_params.get('grid_scale', 2.0)
 
-        # 2. 训练循环
-        for i in range(1000):
-            for camera in camera_list:
-                # --- 关键步骤：可微提取 Mesh ---
-                # 输出的 vertices 和 faces 是可导的！
-                vertices, faces, L_dev = fc(
-                    sdf, 
-                    weight, 
-                    voxel_resolution=resolution,
-                )
+        # 应用变形（参考官方示例：使用tanh限制变形范围）
+        # 变形范围限制为网格单元大小的一半
+        max_deform = (grid_scale - 1e-8) / (resolution * 2)
+        grid_verts = x_nx3 + max_deform * torch.tanh(deform)
 
-                mesh = trimesh.Trimesh(
-                    vertices=vertices.detach().clone().cpu().numpy(),
-                    faces=faces.cpu().numpy(),
-                )
+        # 使用FlexiCubes提取mesh
+        # 参考官方API：
+        # beta: [F, 12] - 12条边的插值权重
+        # alpha: [F, 8] - 8个顶点的权重
+        # gamma_f: [F] - 每个立方体的权重
+        vertices, faces, L_dev = fc(
+            grid_verts,           # voxelgrid_vertices
+            sdf,                  # scalar_field
+            cube_fx8,             # cube_idx
+            resolution,           # resolution
+            beta=weight[:, :12],        # 12条边的插值权重
+            alpha=weight[:, 12:20],     # 8个顶点的权重
+            gamma_f=weight[:, 20],      # 每个立方体的权重（注意是1D）
+            training=training,
+        )
 
-                render_texture_dict = NVDiffRastRenderer.renderTexture(
-                    mesh=mesh,
-                    camera=camera_list[0],
-                    bg_color=bg_color,
-                    vertices_tensor=vertices,
-                )
+        mesh = trimesh.Trimesh(
+            vertices=vertices.detach().cpu().numpy(),
+            faces=faces.cpu().numpy(),
+        )
 
-                render_normal_dict = NVDiffRastRenderer.renderNormal(
-                    mesh=mesh,
-                    camera=camera_list[0],
-                    bg_color=bg_color,
-                    vertices_tensor=vertices,
-                )
-
-                os.makedirs('./output/', exist_ok=True)
-
-                cv2.imwrite('./output/test_render_texture.png', render_texture_dict['image'])
-                cv2.imwrite('./output/test_render_normal_camera.png', render_normal_dict['normal_camera'])
-                cv2.imwrite('./output/test_render_normal_world.png', render_normal_dict['normal_world'])
-
-                loss_reg = kaolin.ops.flexicubes.regularize_weights(weight, sdf)
-
-                (loss_render + loss_reg).backward()
-        return
+        return mesh, vertices, L_dev

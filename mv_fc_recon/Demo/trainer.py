@@ -1,9 +1,12 @@
-import os
-os.path.append('../../MATCH/camera-control')
+import sys
+sys.path.append('../../MATCH/camera-control')
 
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '5'
 import pickle
 
-from mv_fc_recon.Module.fc_convertor import FCConvertor
+from mv_fc_recon.Method.time import getCurrentTime
+from mv_fc_recon.Module.trainer import Trainer
 
 
 def demo():
@@ -27,11 +30,13 @@ def demo():
     with open(camera_pkl_file_path, 'rb') as f:
         camera_list = pickle.load(f)
 
-    fitting_mesh = FCConvertor.fitImages(
+    fitting_mesh = Trainer.fitImages(
         camera_list=camera_list,
         mesh=gen_mesh_file_path,
         resolution=128,
         device=device,
+        log_interval=1,
+        log_dir=data_folder + 'mv-fc-recon/logs/' + getCurrentTime() + '/'
     )
 
     fitting_mesh.export(data_folder + 'fc_fitting_mesh.ply')
