@@ -30,11 +30,12 @@ def demo():
     with open(camera_pkl_file_path, 'rb') as f:
         camera_list = pickle.load(f)
 
-    fitting_mesh = Trainer.fitImages(
+    fitting_mesh = Trainer.fitImagesWithSDFLoss(
         camera_list=camera_list,
         mesh=gen_mesh_file_path,
-        resolution=128,
+        resolution=192,
         device=device,
+        num_iterations=200,
         lr=1e-3,
         log_interval=10,
         log_dir=data_folder + 'mv-fc-recon/logs/' + getCurrentTime() + '/'
