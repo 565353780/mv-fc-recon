@@ -23,7 +23,7 @@ def demo():
 
     data_folder = home + "/chLi/Dataset/pixel_align/" + shape_id + "/"
 
-    camera_pkl_file_path = data_folder + 'camera_cpu.pkl'
+    camera_pkl_file_path = data_folder + 'camera.pkl'
     gen_mesh_file_path = data_folder + "stage2_192_n_d2_d4_d8_d16.ply"
     log_dir = data_folder + 'mv-fc-recon/logs/' + getCurrentTime() + '/'
 

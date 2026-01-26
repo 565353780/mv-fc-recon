@@ -5,7 +5,7 @@ from tqdm import tqdm
 from typing import Union, List, Dict
 from torch.utils.tensorboard import SummaryWriter
 
-from camera_control.Module.rgbd_camera import RGBDCamera
+from camera_control.Module.camera import Camera
 from camera_control.Module.nvdiffrast_renderer import NVDiffRastRenderer
 
 from mv_fc_recon.Loss.flexicubes_reg import (
@@ -61,7 +61,7 @@ class Trainer(object):
 
     @staticmethod
     def fitImagesWithSDFLoss(
-        camera_list: List[RGBDCamera],
+        camera_list: List[Camera],
         mesh: Union[str, trimesh.Trimesh, None] = None,
         resolution: int = 128,
         device: str = 'cuda:0',
@@ -115,7 +115,7 @@ class Trainer(object):
         - 'huber': Huber loss，对大差异使用 L1，小差异使用 L2
 
         Args:
-            camera_list: 相机列表，每个相机应包含 rgb_image 属性
+            camera_list: 相机列表
             mesh: 初始网格（可选），如果为 None 则随机初始化
             resolution: FlexiCubes 分辨率
             device: 计算设备
@@ -146,11 +146,11 @@ class Trainer(object):
             return None
 
         # 将相机移动到指定设备并预处理目标图像
-        target_images = []
+        target_data_list = []
         for camera in camera_list:
             camera.to(device=device)
-            target_rgb = camera.image
-            target_images.append(target_rgb)
+            target_normal = camera.normal
+            target_data_list.append(target_normal)
 
         # 创建优化器
         optimizer = Trainer.createOptimizer(fc_params, lr=lr)
@@ -163,8 +163,8 @@ class Trainer(object):
         if log_dir is not None:
             os.makedirs(log_dir, exist_ok=True)
             writer = SummaryWriter(log_dir=log_dir)
-            for i, target_rgb in enumerate(target_images):
-                writer.add_image(f'GT/Camera_{i}', target_rgb.clone().permute(2, 0, 1), global_step=0)
+            for i, target_data in enumerate(target_data_list):
+                writer.add_image(f'GT/Camera_{i}', target_data.clone().permute(2, 0, 1), global_step=0)
 
         if log_dir:
             with torch.no_grad():
@@ -188,16 +188,12 @@ class Trainer(object):
                 print(f'[WARNING] Invalid mesh at iteration {iteration}, skipping...')
                 continue
 
-            if len(current_mesh.vertices) > 1000000 or len(current_mesh.faces) > 2000000:
-                print(f'[WARNING] Mesh too large at iteration {iteration}, skipping...')
-                continue
-
             # 获取 faces tensor 用于网格平滑
             faces_tensor = torch.from_numpy(current_mesh.faces).long().to(device)
 
             # ========== 渲染损失 ==========
             total_render_loss = 0.0
-            render_rgb_list = []
+            render_data_list = []
             render_idx_list = []
 
             if lambda_render > 0:
@@ -206,9 +202,9 @@ class Trainer(object):
 
                 for idx in batch_indices:
                     camera = camera_list[idx]
-                    target_rgb = target_images[idx]
+                    target_data = target_data_list[idx]
 
-                    render_dict = NVDiffRastRenderer.renderTexture(
+                    render_dict = NVDiffRastRenderer.renderNormal(
                         mesh=current_mesh,
                         camera=camera,
                         bg_color=bg_color,
@@ -216,16 +212,14 @@ class Trainer(object):
                         enable_antialias=True,
                     )
 
-                    render_rgb = render_dict['image']
-                    if render_rgb.max() > 1.0:
-                        render_rgb = render_rgb / 255.0
+                    render_data = render_dict['normal_camera']
 
-                    if len(render_rgb_list) < 4:
-                        render_rgb_list.append(render_rgb.clone())
+                    if len(render_data_list) < 4:
+                        render_data_list.append(render_data.clone())
                         render_idx_list.append(idx)
 
-                    rgb_loss = ((render_rgb - target_rgb).abs()).mean()
-                    total_render_loss = total_render_loss + rgb_loss
+                    render_loss = ((render_data - target_data).abs()).mean()
+                    total_render_loss = total_render_loss + render_loss
 
                 avg_render_loss = total_render_loss / len(batch_indices)
             else:
@@ -345,10 +339,10 @@ class Trainer(object):
             if iteration % log_interval == 0 or iteration == num_iterations - 1:
                 if writer is not None:
                     # 记录渲染图像
-                    for i, (render_rgb, render_idx) in enumerate(zip(render_rgb_list, render_idx_list)):
-                        if render_rgb.dim() == 3 and render_rgb.shape[-1] == 3:
-                            render_rgb = render_rgb.permute(2, 0, 1)
-                        writer.add_image(f'Render/Camera_{render_idx}', render_rgb, global_step=iteration)
+                    for i, (render_data, render_idx) in enumerate(zip(render_data_list, render_idx_list)):
+                        if render_data.dim() == 3 and render_data.shape[-1] == 3:
+                            render_data = render_data.permute(2, 0, 1)
+                        writer.add_image(f'Render/Camera_{render_idx}', render_data, global_step=iteration)
 
             # 更新进度条（只显示实际使用的 loss）
             postfix_dict = {'loss': f'{total_loss.item():.4f}'}
