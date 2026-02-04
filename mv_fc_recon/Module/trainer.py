@@ -8,6 +8,8 @@ from torch.utils.tensorboard import SummaryWriter
 from camera_control.Module.camera import Camera
 from camera_control.Module.nvdiffrast_renderer import NVDiffRastRenderer
 
+from flexi_cubes.Module.fc_convertor import FCConvertor
+
 from mv_fc_recon.Loss.flexicubes_reg import (
     sdf_smoothness_loss,
     sdf_gradient_smoothness_loss,
@@ -15,7 +17,6 @@ from mv_fc_recon.Loss.flexicubes_reg import (
     mesh_laplacian_smoothness_loss,
     mesh_normal_consistency_loss,
 )
-from mv_fc_recon.Module.fc_convertor import FCConvertor
 
 
 class Trainer(object):

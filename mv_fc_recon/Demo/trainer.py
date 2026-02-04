@@ -1,5 +1,6 @@
 import sys
 sys.path.append('../../MATCH/camera-control')
+sys.path.append('../../MATCH/flexi-cubes')
 
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'

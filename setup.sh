@@ -1,12 +1,9 @@
 cd ..
-git clone git@github.com:565353780/camera-control.git
-git clone https://github.com/NVIDIAGameWorks/kaolin.git
+git clone https://github.com/565353780/camera-control.git
+git clone https://github.com/565353780/flexi-cubes.git
 
 cd camera-control
-./dev_setup.sh
+./setup.sh
 
-pip install scipy pickle pygltflib ipyevents ipycanvas \
-  rtree warp-lang
-
-cd ../kaolin
-python setup.py install
+cd ../flexi-cubes
+./setup.sh
