@@ -270,6 +270,69 @@ def mesh_laplacian_smoothness_loss(
     return loss
 
 
+
+def mesh_bi_laplacian_smoothness_loss(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+) -> torch.Tensor:
+    """
+    网格 Bi-Laplacian（薄板能量）平滑损失
+
+    说明：
+        - 先计算 Laplacian: Δv_i = v_i - mean(N(v_i))
+        - 再对 Laplacian 再计算 Laplacian
+        - 最终 L2 norm 平均，抑制顶点高频毛刺 / 曲率震荡
+        - 对顶点可导，适合直接训练
+
+    Args:
+        vertices: [V, 3] 顶点
+        faces: [F, 3] 面片索引
+
+    Returns:
+        loss: bi-Laplacian 平滑损失
+    """
+    device = vertices.device
+    num_vertices = vertices.shape[0]
+
+    # 构建邻接关系
+    edges = torch.cat([
+        faces[:, [0, 1]],
+        faces[:, [1, 2]],
+        faces[:, [2, 0]],
+    ], dim=0)  # [3F, 2]
+
+    # 双向 + 去重
+    edges = torch.cat([edges, edges.flip(1)], dim=0)
+    edges = torch.unique(edges, dim=0)
+
+    src_idx = edges[:, 0]
+    dst_idx = edges[:, 1]
+
+    # ---------- 定义一个内部函数：一次 Laplacian ----------
+    def laplacian(v):
+        neighbor_sum = torch.zeros_like(v)
+        neighbor_count = torch.zeros(num_vertices, device=device)
+        neighbor_sum.scatter_add_(0, dst_idx.unsqueeze(1).expand(-1, 3), v[src_idx])
+        neighbor_count.scatter_add_(0, dst_idx, torch.ones(len(dst_idx), device=device))
+        neighbor_count = neighbor_count.clamp(min=1)
+        neighbor_mean = neighbor_sum / neighbor_count.unsqueeze(1)
+        return v - neighbor_mean
+
+    # 一阶 Laplacian
+    lap1 = laplacian(vertices)
+
+    # 二阶 Laplacian
+    lap2 = laplacian(lap1)
+
+    # L2 loss
+    loss = (lap2 ** 2).sum(dim=-1).mean()
+
+    return loss
+
+
+
+
+
 def mesh_normal_consistency_loss(
     vertices: torch.Tensor,
     faces: torch.Tensor,

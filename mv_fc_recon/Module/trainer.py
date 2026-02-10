@@ -8,12 +8,22 @@ from torch.utils.tensorboard import SummaryWriter
 from camera_control.Module.camera import Camera
 from camera_control.Module.nvdiffrast_renderer import NVDiffRastRenderer
 
+from torchvision.utils import save_image
+from .utils import UTILS 
+from collections import defaultdict 
+from mv_fc_recon.Loss.mesh_geo_energy import (
+    thin_plate_energy,
+    thin_plate_energy_lowmem
+)
+
+
 from mv_fc_recon.Loss.flexicubes_reg import (
     sdf_smoothness_loss,
     sdf_gradient_smoothness_loss,
     weight_regularization_loss,
     mesh_laplacian_smoothness_loss,
     mesh_normal_consistency_loss,
+    mesh_bi_laplacian_smoothness_loss,
 )
 from mv_fc_recon.Module.fc_convertor import FCConvertor
 
@@ -68,22 +78,44 @@ class Trainer(object):
         bg_color: list = [255, 255, 255],
         num_iterations: int = 120,
         lr: float = 5e-4,
+        # lr: float = 1,
+
         # 渲染权重（主要驱动力，引导网格变化）
-        lambda_render: float = 1.0,         # 渲染损失权重
+        # lambda_render: float = 1.0,         # 渲染损失权重
+        # # FlexiCubes 专用正则化（推荐使用）
+        # lambda_sdf_smooth: float = 0.1,     # SDF 平滑：惩罚相邻网格点 SDF 差异
+        # lambda_sdf_grad_smooth: float = 0.01,  # SDF 二阶平滑：惩罚梯度变化（更好保持细节）
+        # lambda_weight_reg: float = 0.01,    # 权重正则化：约束 alpha/beta/gamma
+        # lambda_mesh_smooth: float = 0.01,    # 网格 Laplacian 平滑（可选）
+        # lambda_normal_consistency: float = 0.01,  # 法线一致性（可选）
+        # lambda_dev: float = 0.5,            # FlexiCubes 可展性正则化
+        # # SDF 平滑参数
+        # sdf_smooth_mode: str = 'adaptive',  # 'l2', 'adaptive', 'huber' (推荐 'l2'，adaptive 可能信号太少)
+        # sdf_smooth_threshold: float = 0.05,  # adaptive/huber 模式的阈值
+        # # 动态权重调整
+        # dynamic_sdf_smooth: bool = False,   # 是否动态调整 SDF 平滑权重
+        # sdf_smooth_warmup: int = 50,       # 动态调整的 warmup 迭代数
+        # sdf_smooth_scale: float = 2.0,      # 动态调整的最大缩放因子
+
+        # 渲染权重（主要驱动力，引导网格变化）
+        lambda_render: float = 1e2,         # 渲染损失权重
+        lambda_thin_plate_energy: float = 1e-6 ,  ## 1e-6
+
         # FlexiCubes 专用正则化（推荐使用）
         lambda_sdf_smooth: float = 0.1,     # SDF 平滑：惩罚相邻网格点 SDF 差异
         lambda_sdf_grad_smooth: float = 0.01,  # SDF 二阶平滑：惩罚梯度变化（更好保持细节）
         lambda_weight_reg: float = 0.01,    # 权重正则化：约束 alpha/beta/gamma
-        lambda_mesh_smooth: float = 0.01,    # 网格 Laplacian 平滑（可选）
+        lambda_mesh_smooth: float = 0.0,    # 网格 Laplacian 平滑（可选）
         lambda_normal_consistency: float = 0.01,  # 法线一致性（可选）
-        lambda_dev: float = 0.5,            # FlexiCubes 可展性正则化
+        lambda_dev: float = 0.1,            # FlexiCubes 可展性正则化
         # SDF 平滑参数
-        sdf_smooth_mode: str = 'adaptive',  # 'l2', 'adaptive', 'huber' (推荐 'l2'，adaptive 可能信号太少)
-        sdf_smooth_threshold: float = 0.05,  # adaptive/huber 模式的阈值
+        sdf_smooth_mode: str = 'l2',  # 'l2', 'adaptive', 'huber' (推荐 'l2'，adaptive 可能信号太少)
+        sdf_smooth_threshold: float = 0,  # adaptive/huber 模式的阈值
         # 动态权重调整
         dynamic_sdf_smooth: bool = False,   # 是否动态调整 SDF 平滑权重
-        sdf_smooth_warmup: int = 50,       # 动态调整的 warmup 迭代数
-        sdf_smooth_scale: float = 2.0,      # 动态调整的最大缩放因子
+        sdf_smooth_warmup: int = 0,       # 动态调整的 warmup 迭代数
+        sdf_smooth_scale: float = 0,      # 动态调整的最大缩放因子
+
         # 传统 SDF 约束（不推荐用于 FlexiCubes，默认关闭）
         # 其他参数
         log_interval: int = 10,
@@ -183,6 +215,12 @@ class Trainer(object):
             # 从 FlexiCubes 参数提取 mesh
             current_mesh, vertices, L_dev = FCConvertor.extractMesh(fc_params, training=True)
 
+
+            print(f"---- iter {iteration} ----") 
+            if iteration==0 or (iteration+1)%5 == 0: 
+                print(current_mesh, curr_mesh) 
+                current_mesh.export(f"/home/zhaozihan/mv-fc-recon/mv_fc_recon/tmp/thinE/iter_{iteration}.off", file_type="off") 
+            
             # 检查网格有效性
             if current_mesh is None or len(current_mesh.vertices) == 0 or len(current_mesh.faces) == 0:
                 print(f'[WARNING] Invalid mesh at iteration {iteration}, skipping...')
@@ -199,8 +237,12 @@ class Trainer(object):
             if lambda_render > 0:
                 num_cameras = len(camera_list)
                 batch_indices = list(range(num_cameras))
+                # face2targetN = defaultdict(list)
+                # face_centroids = None 
+
 
                 for idx in batch_indices:
+
                     camera = camera_list[idx]
                     target_data = target_data_list[idx]
 
@@ -210,9 +252,53 @@ class Trainer(object):
                         bg_color=bg_color,
                         vertices_tensor=vertices,
                         enable_antialias=True,
+                        ##zzh 
+                        target_data=target_data
                     )
-
                     render_data = render_dict['normal_camera']
+                    # if face_centroids == None: 
+                    #     face_centroids = render_dict['face_centroids']
+                    
+                    # img = render_data.detach().cpu()          # [H, W, C]
+                    # img = img.permute(2, 0, 1)                 # -> [C, H, W]
+                    # save_image(
+                    #     img,
+                    #     f"./raster_camera_{i}.png"
+                    # )
+
+                    '''
+                    # img = target_data.detach().cpu()          # [H, W, C]
+                    # img = img.permute(2, 0, 1)                 # -> [C, H, W]
+                    # save_image(
+                    #     img,
+                    #     f"./target_data_{i}.png"
+                    # )
+                    ## zzh: try renderDepth
+                    # render_dict = NVDiffRastRenderer.renderDepth(
+                    #     mesh=current_mesh,
+                    #     camera=camera,
+                    #     bg_color=bg_color,
+                    #     vertices_tensor=vertices,
+                    #     enable_antialias=True,
+                    #     ##zzh 
+                    #     target_data=target_data
+                    # )
+                    # render_data = render_dict['image']
+                    # # writer.add_image(f'Depth/Camera_{i}', render_data.clone().permute(2, 0, 1), global_step=0)
+                    # img = render_data.detach().cpu()          # [H, W, C]
+                    # img = img.permute(2, 0, 1)                 # -> [C, H, W]
+                    # save_image(
+                    #     img,
+                    #     f"./depth_camera_{i}.png"
+                    # )
+                    '''
+
+                    ## zzh: collect all target normals for the mesh 
+                    # valid_faces_cpu = render_dict['valid_faces_id'].detach().cpu().numpy()  # [N] tensor, face indices (0-based)
+                    # target_normals_cpu = render_dict['target_normals'].detach().cpu().numpy()  # [N, 3] tensor
+                    # for fidx, normal in zip(valid_faces_cpu, target_normals_cpu):
+                    #     face2targetN[fidx].append(normal)  # 叠加所有像素的 normal
+
 
                     if len(render_data_list) < 4:
                         render_data_list.append(render_data.clone())
@@ -222,8 +308,24 @@ class Trainer(object):
                     total_render_loss = total_render_loss + render_loss
 
                 avg_render_loss = total_render_loss / len(batch_indices)
+
+                ## zzh: remove duplicate normals 
+                # UTILS.output_multiple_XYZN(
+                #     face2targetN=face2targetN, 
+                #     face_centroid=face_centroids
+                # )
+
+
+                # print("程序运行结束，按 Enter 键退出...")
+                # input()
+                # pass 
+
             else:
                 avg_render_loss = torch.tensor(0.0, device=device)
+            
+
+
+
 
             # ========== 计算实际使用的 Loss ==========
             # 只计算权重 > 0 的 loss，避免不必要的计算
@@ -245,8 +347,18 @@ class Trainer(object):
             total_loss = torch.tensor(0.0, device=device)
             loss_dict = {}  # 用于 TensorBoard 记录
 
+            ## thin-plate energy 
+            if lambda_thin_plate_energy > 0: 
+                thinplate_loss = lambda_thin_plate_energy * thin_plate_energy_lowmem(
+                    vertices, faces_tensor
+                ) 
+                total_loss = total_loss + thinplate_loss 
+                print("thin plate: ", thinplate_loss ) 
+                loss_dict['thinPlateE'] = avg_render_loss.item()
+
             # 渲染损失
-            if lambda_render > 0:
+            if lambda_render > 0 :
+                print("render: ", avg_render_loss) 
                 total_loss = total_loss + lambda_render * avg_render_loss
                 loss_dict['Render'] = avg_render_loss.item()
 
@@ -281,10 +393,15 @@ class Trainer(object):
                 loss_dict['Weight_Reg'] = loss_weight_reg.item()
 
             # 网格 Laplacian 平滑损失
-            if lambda_mesh_smooth > 0:
-                loss_mesh_smooth = mesh_laplacian_smoothness_loss(vertices, faces_tensor)
+            # 不如优化图像上 当前渲染的normal map rgb图的光滑程度？
+            if lambda_mesh_smooth > 0 and iteration >= 200 :
+                print("in laplacian") 
+                loss_mesh_smooth = mesh_bi_laplacian_smoothness_loss(vertices, faces_tensor)
+                # loss_mesh_smooth = mesh_laplacian_smoothness_loss(vertices, faces_tensor)
                 total_loss = total_loss + lambda_mesh_smooth * loss_mesh_smooth
                 loss_dict['Mesh_Smooth'] = loss_mesh_smooth.item()
+
+                print("laplace loss: ", loss_mesh_smooth)
 
             # 法线一致性损失
             if lambda_normal_consistency > 0:
@@ -292,8 +409,13 @@ class Trainer(object):
                 total_loss = total_loss + lambda_normal_consistency * loss_normal_consistency
                 loss_dict['Normal_Consistency'] = loss_normal_consistency.item()
 
+                print("loss_normal_consistency: ", loss_normal_consistency)
+
             # 检查损失是否包含 NaN 或 Inf
             if torch.isnan(total_loss) or torch.isinf(total_loss):
+                # [WARNING] NaN/Inf gradients at iteration 18, skipping update...
+
+                
                 print(f'[WARNING] Invalid loss (NaN/Inf) at iteration {iteration}, skipping...')
                 continue
 
@@ -316,6 +438,8 @@ class Trainer(object):
 
             if has_nan_grad:
                 print(f'[WARNING] NaN/Inf gradients at iteration {iteration}, skipping update...')
+                # print(loss_dict) 
+                # input() 
                 optimizer.zero_grad()
                 continue
 

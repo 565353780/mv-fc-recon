@@ -150,6 +150,8 @@ class FCConvertor(object):
                 print('\t mesh_file_path:', mesh)
                 return None
             mesh = loadMeshFile(mesh)
+            # mesh.vertices =  mesh.vertices * 0.5 
+            # print("debug: ", mesh.vertices.shape, mesh.faces.shape )
 
         # 创建FlexiCubes对象
         fc = FlexiCubes(device=device)
