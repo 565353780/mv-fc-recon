@@ -2,10 +2,9 @@ import os
 import torch
 import trimesh
 from tqdm import tqdm
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Optional
 from torch.utils.tensorboard import SummaryWriter
 
-from camera_control.Method.path import createFileFolder
 from camera_control.Module.camera import Camera
 from camera_control.Module.nvdiffrast_renderer import NVDiffRastRenderer
 
@@ -19,7 +18,6 @@ from mv_fc_recon.Loss.flexicubes_reg import (
     mesh_bi_laplacian_smoothness_loss,
 )
 from mv_fc_recon.Loss.mesh_geo_energy import thin_plate_energy
-from mv_fc_recon.Method.utils import output_multiple_XYZN
 
 
 class Trainer(object):
@@ -30,9 +28,9 @@ class Trainer(object):
     def createOptimizer(
         fc_params: Dict,
         lr: float = 0.01,
-        lr_sdf: float = None,
-        lr_deform: float = None,
-        lr_weight: float = None,
+        lr_sdf: Optional[float] = None,
+        lr_deform: Optional[float] = None,
+        lr_weight: Optional[float] = None,
     ) -> torch.optim.Adam:
         """
         为FlexiCubes参数创建优化器
@@ -72,29 +70,9 @@ class Trainer(object):
         bg_color: list = [255, 255, 255],
         num_iterations: int = 120,
         lr: float = 5e-4,
-        # lr: float = 1,
-
         # 渲染权重（主要驱动力，引导网格变化）
-        # lambda_render: float = 1.0,         # 渲染损失权重
-        # # FlexiCubes 专用正则化（推荐使用）
-        # lambda_sdf_smooth: float = 0.1,     # SDF 平滑：惩罚相邻网格点 SDF 差异
-        # lambda_sdf_grad_smooth: float = 0.01,  # SDF 二阶平滑：惩罚梯度变化（更好保持细节）
-        # lambda_weight_reg: float = 0.01,    # 权重正则化：约束 alpha/beta/gamma
-        # lambda_mesh_smooth: float = 0.01,    # 网格 Laplacian 平滑（可选）
-        # lambda_normal_consistency: float = 0.01,  # 法线一致性（可选）
-        # lambda_dev: float = 0.5,            # FlexiCubes 可展性正则化
-        # # SDF 平滑参数
-        # sdf_smooth_mode: str = 'adaptive',  # 'l2', 'adaptive', 'huber' (推荐 'l2'，adaptive 可能信号太少)
-        # sdf_smooth_threshold: float = 0.05,  # adaptive/huber 模式的阈值
-        # # 动态权重调整
-        # dynamic_sdf_smooth: bool = False,   # 是否动态调整 SDF 平滑权重
-        # sdf_smooth_warmup: int = 50,       # 动态调整的 warmup 迭代数
-        # sdf_smooth_scale: float = 2.0,      # 动态调整的最大缩放因子
-
-        # 渲染权重（主要驱动力，引导网格变化）
-        lambda_render: float = 1e2,         # 渲染损失权重
-        lambda_thin_plate_energy: float = 1e-6 ,  ## 1e-6
-
+        lambda_render: float = 1.0,         # 渲染损失权重
+        lambda_thin_plate_energy: float = 1e-6,  ## 1e-6
         # FlexiCubes 专用正则化（推荐使用）
         lambda_sdf_smooth: float = 0.1,     # SDF 平滑：惩罚相邻网格点 SDF 差异
         lambda_sdf_grad_smooth: float = 0.01,  # SDF 二阶平滑：惩罚梯度变化（更好保持细节）
@@ -105,12 +83,6 @@ class Trainer(object):
         # SDF 平滑参数
         sdf_smooth_mode: str = 'l2',  # 'l2', 'adaptive', 'huber' (推荐 'l2'，adaptive 可能信号太少)
         sdf_smooth_threshold: float = 0,  # adaptive/huber 模式的阈值
-        # 动态权重调整
-        dynamic_sdf_smooth: bool = False,   # 是否动态调整 SDF 平滑权重
-        sdf_smooth_warmup: int = 0,       # 动态调整的 warmup 迭代数
-        sdf_smooth_scale: float = 0,      # 动态调整的最大缩放因子
-
-        # 传统 SDF 约束（不推荐用于 FlexiCubes，默认关闭）
         # 其他参数
         log_interval: int = 10,
         log_dir: str = './output/',
@@ -118,22 +90,10 @@ class Trainer(object):
         """通过多视角图像拟合 FlexiCubes 参数
 
         ⚠️ 重要说明：FlexiCubes 的 SDF 与传统 SDF（NeuS、NeuralAngelo）有本质区别！
-
         FlexiCubes 的 SDF 特点：
         1. 只需要符号正确（正=外部，负=内部），不需要是真正的距离场
         2. SDF 值的尺度是任意的，不需要满足 ||∇SDF|| = 1
         3. 表面位置由 SDF 零交叉点决定，而非 SDF 值本身
-
-        因此：
-        - ✅ SDF 平滑正则化：惩罚相邻网格点 SDF 差异过大
-        - ✅ SDF 二阶平滑：惩罚梯度变化，更好地保持几何细节
-        - ✅ 权重正则化：约束 FlexiCubes 的 alpha/beta/gamma 权重
-        - ✅ 网格 Laplacian 平滑：直接在提取的网格顶点上平滑
-        - ✅ 法线一致性：惩罚相邻面片法线差异过大
-
-        训练策略：
-        - Render loss 作为主要驱动力，引导网格向目标图像对齐
-        - FlexiCubes 专用正则化确保表面平滑
 
         SDF 平滑模式说明：
         - 'l2': 简单 L2 平滑，惩罚所有 SDF 差异
@@ -157,7 +117,6 @@ class Trainer(object):
             lambda_dev: FlexiCubes developability 正则化权重
             sdf_smooth_mode: SDF 平滑模式 ('l2', 'adaptive', 'huber')
             sdf_smooth_threshold: adaptive/huber 模式的阈值
-            dynamic_sdf_smooth: 是否动态调整 SDF 平滑权重
             sdf_smooth_warmup: 动态调整的 warmup 迭代数
             sdf_smooth_scale: 动态调整的最大缩放因子
             log_interval: 日志打印间隔
@@ -209,14 +168,6 @@ class Trainer(object):
             # 从 FlexiCubes 参数提取 mesh
             current_mesh, vertices, L_dev = FCConvertor.extractMesh(fc_params, training=True)
 
-
-            print(f"---- iter {iteration} ----") 
-            if iteration==0 or (iteration+1)%5 == 0:
-                print(current_mesh, curr_mesh)
-                save_mesh_file_path = log_dir + f"/thinE/iter_{iteration}.ply"
-                createFileFolder(save_mesh_file_path)
-                current_mesh.export(save_mesh_file_path)
-
             # 检查网格有效性
             if current_mesh is None or len(current_mesh.vertices) == 0 or len(current_mesh.faces) == 0:
                 print(f'[WARNING] Invalid mesh at iteration {iteration}, skipping...')
@@ -230,67 +181,23 @@ class Trainer(object):
             render_data_list = []
             render_idx_list = []
 
+            avg_render_loss = torch.tensor(0.0, device=device)
             if lambda_render > 0:
                 num_cameras = len(camera_list)
                 batch_indices = list(range(num_cameras))
-                # face2targetN = defaultdict(list)
-                # face_centroids = None 
 
                 for idx in batch_indices:
 
                     camera = camera_list[idx]
+                    target_data = target_data_list[idx]
 
                     render_dict = NVDiffRastRenderer.renderNormal(
                         mesh=current_mesh,
                         camera=camera,
                         bg_color=bg_color,
                         vertices_tensor=vertices,
-                        enable_antialias=True,
                     )
                     render_data = render_dict['normal_camera']
-                    # if face_centroids == None: 
-                    #     face_centroids = render_dict['face_centroids']
-                    
-                    # img = render_data.detach().cpu()          # [H, W, C]
-                    # img = img.permute(2, 0, 1)                 # -> [C, H, W]
-                    # save_image(
-                    #     img,
-                    #     f"./raster_camera_{i}.png"
-                    # )
-
-                    '''
-                    # img = target_data.detach().cpu()          # [H, W, C]
-                    # img = img.permute(2, 0, 1)                 # -> [C, H, W]
-                    # save_image(
-                    #     img,
-                    #     f"./target_data_{i}.png"
-                    # )
-                    ## zzh: try renderDepth
-                    # render_dict = NVDiffRastRenderer.renderDepth(
-                    #     mesh=current_mesh,
-                    #     camera=camera,
-                    #     bg_color=bg_color,
-                    #     vertices_tensor=vertices,
-                    #     enable_antialias=True,
-                    #     ##zzh 
-                    #     target_data=target_data
-                    # )
-                    # render_data = render_dict['image']
-                    # # writer.add_image(f'Depth/Camera_{i}', render_data.clone().permute(2, 0, 1), global_step=0)
-                    # img = render_data.detach().cpu()          # [H, W, C]
-                    # img = img.permute(2, 0, 1)                 # -> [C, H, W]
-                    # save_image(
-                    #     img,
-                    #     f"./depth_camera_{i}.png"
-                    # )
-                    '''
-
-                    ## zzh: collect all target normals for the mesh 
-                    # valid_faces_cpu = render_dict['valid_faces_id'].detach().cpu().numpy()  # [N] tensor, face indices (0-based)
-                    # target_normals_cpu = render_dict['target_normals'].detach().cpu().numpy()  # [N, 3] tensor
-                    # for fidx, normal in zip(valid_faces_cpu, target_normals_cpu):
-                    #     face2targetN[fidx].append(normal)  # 叠加所有像素的 normal
-
 
                     if len(render_data_list) < 4:
                         render_data_list.append(render_data.clone())
@@ -301,35 +208,12 @@ class Trainer(object):
 
                 avg_render_loss = total_render_loss / len(batch_indices)
 
-                ## zzh: remove duplicate normals 
-                # output_multiple_XYZN(
-                #     face2targetN=face2targetN, 
-                #     face_centroid=face_centroids
-                # )
-
-
-                # print("程序运行结束，按 Enter 键退出...")
-                # input()
-                # pass 
-
-            else:
-                avg_render_loss = torch.tensor(0.0, device=device)
-
             # ========== 计算实际使用的 Loss ==========
-            # 只计算权重 > 0 的 loss，避免不必要的计算
-
             # FlexiCubes developability 正则化损失
             loss_dev = L_dev.mean() if L_dev is not None and L_dev.numel() > 0 else torch.tensor(0.0, device=device)
 
             # 动态调整 SDF 平滑权重
             current_lambda_sdf_smooth = lambda_sdf_smooth
-            if dynamic_sdf_smooth and lambda_sdf_smooth > 0:
-                if iteration < sdf_smooth_warmup:
-                    smooth_weight_factor = 1.0
-                else:
-                    progress = (iteration - sdf_smooth_warmup) / max(1, num_iterations - sdf_smooth_warmup)
-                    smooth_weight_factor = 1.0 + (sdf_smooth_scale - 1.0) * progress
-                current_lambda_sdf_smooth = lambda_sdf_smooth * smooth_weight_factor
 
             # 计算总损失（只包含权重 > 0 的项）
             total_loss = torch.tensor(0.0, device=device)
@@ -339,14 +223,12 @@ class Trainer(object):
             if lambda_thin_plate_energy > 0: 
                 thinplate_loss = lambda_thin_plate_energy * thin_plate_energy(
                     vertices, faces_tensor
-                ) 
+                )
                 total_loss = total_loss + thinplate_loss 
-                print("thin plate: ", thinplate_loss )
                 loss_dict['thinPlateE'] = avg_render_loss.item()
 
             # 渲染损失
             if lambda_render > 0 :
-                print("render: ", avg_render_loss) 
                 total_loss = total_loss + lambda_render * avg_render_loss
                 loss_dict['Render'] = avg_render_loss.item()
 
@@ -383,7 +265,6 @@ class Trainer(object):
             # 网格 Laplacian 平滑损失
             # 不如优化图像上 当前渲染的normal map rgb图的光滑程度？
             if lambda_mesh_smooth > 0 and iteration >= 200 :
-                print("in laplacian") 
                 loss_mesh_smooth = mesh_bi_laplacian_smoothness_loss(vertices, faces_tensor)
                 total_loss = total_loss + lambda_mesh_smooth * loss_mesh_smooth
                 loss_dict['Mesh_Smooth'] = loss_mesh_smooth.item()
@@ -396,12 +277,8 @@ class Trainer(object):
                 total_loss = total_loss + lambda_normal_consistency * loss_normal_consistency
                 loss_dict['Normal_Consistency'] = loss_normal_consistency.item()
 
-                print("loss_normal_consistency: ", loss_normal_consistency)
-
             # 检查损失是否包含 NaN 或 Inf
             if torch.isnan(total_loss) or torch.isinf(total_loss):
-                # [WARNING] NaN/Inf gradients at iteration 18, skipping update...
-
                 print(f'[WARNING] Invalid loss (NaN/Inf) at iteration {iteration}, skipping...')
                 continue
 
@@ -424,9 +301,8 @@ class Trainer(object):
 
             if has_nan_grad:
                 print(f'[WARNING] NaN/Inf gradients at iteration {iteration}, skipping update...')
-                # print(loss_dict) 
-                # input() 
                 optimizer.zero_grad()
+                exit()
                 continue
 
             # 更新参数
@@ -441,9 +317,6 @@ class Trainer(object):
                 # 记录所有实际计算的 loss
                 for loss_name, loss_value in loss_dict.items():
                     writer.add_scalar(f'Loss/{loss_name}', loss_value, iteration)
-                # 记录动态权重
-                if dynamic_sdf_smooth and lambda_sdf_smooth > 0:
-                    writer.add_scalar('Weight/SDF_Smooth', current_lambda_sdf_smooth, iteration)
 
             # 更新进度条和日志
             if iteration % log_interval == 0 or iteration == num_iterations - 1:
@@ -462,6 +335,8 @@ class Trainer(object):
                 postfix_dict['sdf_sm'] = f'{loss_dict["SDF_Smooth"]:.6f}'
             if 'Dev' in loss_dict:
                 postfix_dict['dev'] = f'{loss_dict["Dev"]:.6f}'
+            if 'Normal_Consistency' in loss_dict:
+                postfix_dict['normal'] = f'{loss_dict["Normal_Consistency"]:.6f}'
             pbar.set_postfix(postfix_dict)
 
         # 关闭 TensorBoard writer

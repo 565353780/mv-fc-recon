@@ -3,7 +3,7 @@ sys.path.append('../camera-control')
 sys.path.append('../flexi-cubes')
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import pickle
 
 from camera_control.Method.io import loadMeshFile
