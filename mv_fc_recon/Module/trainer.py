@@ -5,26 +5,21 @@ from tqdm import tqdm
 from typing import Union, List, Dict
 from torch.utils.tensorboard import SummaryWriter
 
+from camera_control.Method.path import createFileFolder
 from camera_control.Module.camera import Camera
 from camera_control.Module.nvdiffrast_renderer import NVDiffRastRenderer
 
-from torchvision.utils import save_image
-from .utils import UTILS 
-from collections import defaultdict 
-from mv_fc_recon.Loss.mesh_geo_energy import (
-    thin_plate_energy,
-    thin_plate_energy_lowmem
-)
-
+from flexi_cubes.Module.fc_convertor import FCConvertor
 
 from mv_fc_recon.Loss.flexicubes_reg import (
     sdf_smoothness_loss,
     sdf_gradient_smoothness_loss,
     weight_regularization_loss,
-    mesh_laplacian_smoothness_loss,
     mesh_normal_consistency_loss,
     mesh_bi_laplacian_smoothness_loss,
 )
+from mv_fc_recon.Loss.mesh_geo_energy import thin_plate_energy
+from mv_fc_recon.Method.utils import output_multiple_XYZN
 
 
 class Trainer(object):
@@ -216,10 +211,12 @@ class Trainer(object):
 
 
             print(f"---- iter {iteration} ----") 
-            if iteration==0 or (iteration+1)%5 == 0: 
-                print(current_mesh, curr_mesh) 
-                current_mesh.export(f"/home/zhaozihan/mv-fc-recon/mv_fc_recon/tmp/thinE/iter_{iteration}.off", file_type="off") 
-            
+            if iteration==0 or (iteration+1)%5 == 0:
+                print(current_mesh, curr_mesh)
+                save_mesh_file_path = log_dir + f"/thinE/iter_{iteration}.ply"
+                createFileFolder(save_mesh_file_path)
+                current_mesh.export(save_mesh_file_path)
+
             # 检查网格有效性
             if current_mesh is None or len(current_mesh.vertices) == 0 or len(current_mesh.faces) == 0:
                 print(f'[WARNING] Invalid mesh at iteration {iteration}, skipping...')
@@ -239,11 +236,9 @@ class Trainer(object):
                 # face2targetN = defaultdict(list)
                 # face_centroids = None 
 
-
                 for idx in batch_indices:
 
                     camera = camera_list[idx]
-                    target_data = target_data_list[idx]
 
                     render_dict = NVDiffRastRenderer.renderNormal(
                         mesh=current_mesh,
@@ -251,8 +246,6 @@ class Trainer(object):
                         bg_color=bg_color,
                         vertices_tensor=vertices,
                         enable_antialias=True,
-                        ##zzh 
-                        target_data=target_data
                     )
                     render_data = render_dict['normal_camera']
                     # if face_centroids == None: 
@@ -309,7 +302,7 @@ class Trainer(object):
                 avg_render_loss = total_render_loss / len(batch_indices)
 
                 ## zzh: remove duplicate normals 
-                # UTILS.output_multiple_XYZN(
+                # output_multiple_XYZN(
                 #     face2targetN=face2targetN, 
                 #     face_centroid=face_centroids
                 # )
@@ -321,10 +314,6 @@ class Trainer(object):
 
             else:
                 avg_render_loss = torch.tensor(0.0, device=device)
-            
-
-
-
 
             # ========== 计算实际使用的 Loss ==========
             # 只计算权重 > 0 的 loss，避免不必要的计算
@@ -348,11 +337,11 @@ class Trainer(object):
 
             ## thin-plate energy 
             if lambda_thin_plate_energy > 0: 
-                thinplate_loss = lambda_thin_plate_energy * thin_plate_energy_lowmem(
+                thinplate_loss = lambda_thin_plate_energy * thin_plate_energy(
                     vertices, faces_tensor
                 ) 
                 total_loss = total_loss + thinplate_loss 
-                print("thin plate: ", thinplate_loss ) 
+                print("thin plate: ", thinplate_loss )
                 loss_dict['thinPlateE'] = avg_render_loss.item()
 
             # 渲染损失
@@ -396,7 +385,6 @@ class Trainer(object):
             if lambda_mesh_smooth > 0 and iteration >= 200 :
                 print("in laplacian") 
                 loss_mesh_smooth = mesh_bi_laplacian_smoothness_loss(vertices, faces_tensor)
-                # loss_mesh_smooth = mesh_laplacian_smoothness_loss(vertices, faces_tensor)
                 total_loss = total_loss + lambda_mesh_smooth * loss_mesh_smooth
                 loss_dict['Mesh_Smooth'] = loss_mesh_smooth.item()
 
@@ -414,7 +402,6 @@ class Trainer(object):
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 # [WARNING] NaN/Inf gradients at iteration 18, skipping update...
 
-                
                 print(f'[WARNING] Invalid loss (NaN/Inf) at iteration {iteration}, skipping...')
                 continue
 
