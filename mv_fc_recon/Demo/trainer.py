@@ -3,7 +3,7 @@ sys.path.append('../camera-control')
 sys.path.append('../flexi-cubes')
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 import pickle
 
 from camera_control.Method.io import loadMeshFile
@@ -65,7 +65,7 @@ def demo():
     fitting_mesh = Trainer.fitImagesWithSDFLoss(
         camera_list=camera_list,
         mesh=mesh,
-        resolution=192,
+        resolution=128,
         device=device,
         num_iterations=200,
         log_interval=5,
