@@ -72,7 +72,7 @@ class Trainer(object):
         lr: float = 5e-4,
         # 渲染权重（主要驱动力，引导网格变化）
         lambda_render: float = 1.0,         # 渲染损失权重
-        lambda_thin_plate_energy: float = 0.1,  ## 1e-6
+        lambda_thin_plate_energy: float = 0.5,  ## 1e-6
         # FlexiCubes 专用正则化（推荐使用）
         lambda_sdf_smooth: float = 0.1,     # SDF 平滑：惩罚相邻网格点 SDF 差异
         lambda_sdf_grad_smooth: float = 0.01,  # SDF 二阶平滑：惩罚梯度变化（更好保持细节）
@@ -219,12 +219,20 @@ class Trainer(object):
             # FlexiCubes developability 正则化损失
             loss_dev = L_dev.mean() if L_dev is not None and L_dev.numel() > 0 else torch.tensor(0.0, device=device)
 
-            ## thin-plate energy
+            ## thin-plate energy（缩放到与 render 成固定比例，作为稳定辅助 loss）
             if lambda_thin_plate_energy > 0:
                 thinplate_loss = thin_plate_energy(
                     vertices, faces_tensor
                 )
-                total_loss = total_loss + lambda_thin_plate_energy * thinplate_loss
+                if lambda_render > 0 and avg_render_loss.numel() > 0:
+                    # 目标贡献 = lambda_thin_plate_energy/(lambda_render+lambda_thin_plate_energy)*avg_render_loss
+                    # 缩放因子计算全部无梯度，梯度只从 thinplate_loss 反传
+                    target_contribution = (lambda_thin_plate_energy / (lambda_render + lambda_thin_plate_energy)) * avg_render_loss.detach()
+                    scale = target_contribution / (thinplate_loss.detach() + 1e-8)
+                    scaled_thinplate = scale.detach() * thinplate_loss
+                    total_loss = total_loss + scaled_thinplate
+                else:
+                    total_loss = total_loss + lambda_thin_plate_energy * thinplate_loss
                 loss_dict['thinPlateE'] = thinplate_loss.item()
 
             # FlexiCubes developability
