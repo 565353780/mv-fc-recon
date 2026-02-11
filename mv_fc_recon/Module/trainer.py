@@ -72,7 +72,7 @@ class Trainer(object):
         lr: float = 5e-4,
         # 渲染权重（主要驱动力，引导网格变化）
         lambda_render: float = 1.0,         # 渲染损失权重
-        lambda_thin_plate_energy: float = 1e-6,  ## 1e-6
+        lambda_thin_plate_energy: float = 0.1,  ## 1e-6
         # FlexiCubes 专用正则化（推荐使用）
         lambda_sdf_smooth: float = 0.1,     # SDF 平滑：惩罚相邻网格点 SDF 差异
         lambda_sdf_grad_smooth: float = 0.01,  # SDF 二阶平滑：惩罚梯度变化（更好保持细节）
@@ -176,6 +176,11 @@ class Trainer(object):
             # 获取 faces tensor 用于网格平滑
             faces_tensor = torch.from_numpy(current_mesh.faces).long().to(device)
 
+            # ========== 计算实际使用的 Loss ==========
+            # 计算总损失（只包含权重 > 0 的项）
+            total_loss = torch.tensor(0.0, device=device)
+            loss_dict = {}  # 用于 TensorBoard 记录
+
             # ========== 渲染损失 ==========
             total_render_loss = 0.0
             render_data_list = []
@@ -208,29 +213,19 @@ class Trainer(object):
 
                 avg_render_loss = total_render_loss / len(batch_indices)
 
-            # ========== 计算实际使用的 Loss ==========
+                total_loss = total_loss + lambda_render * avg_render_loss
+                loss_dict['Render'] = avg_render_loss.item()
+
             # FlexiCubes developability 正则化损失
             loss_dev = L_dev.mean() if L_dev is not None and L_dev.numel() > 0 else torch.tensor(0.0, device=device)
 
-            # 动态调整 SDF 平滑权重
-            current_lambda_sdf_smooth = lambda_sdf_smooth
-
-            # 计算总损失（只包含权重 > 0 的项）
-            total_loss = torch.tensor(0.0, device=device)
-            loss_dict = {}  # 用于 TensorBoard 记录
-
-            ## thin-plate energy 
-            if lambda_thin_plate_energy > 0: 
-                thinplate_loss = lambda_thin_plate_energy * thin_plate_energy(
+            ## thin-plate energy
+            if lambda_thin_plate_energy > 0:
+                thinplate_loss = thin_plate_energy(
                     vertices, faces_tensor
                 )
-                total_loss = total_loss + thinplate_loss 
-                loss_dict['thinPlateE'] = avg_render_loss.item()
-
-            # 渲染损失
-            if lambda_render > 0 :
-                total_loss = total_loss + lambda_render * avg_render_loss
-                loss_dict['Render'] = avg_render_loss.item()
+                total_loss = total_loss + lambda_thin_plate_energy * thinplate_loss
+                loss_dict['thinPlateE'] = thinplate_loss.item()
 
             # FlexiCubes developability
             if lambda_dev > 0:
@@ -238,13 +233,13 @@ class Trainer(object):
                 loss_dict['Dev'] = loss_dev.item()
 
             # SDF 平滑损失
-            if current_lambda_sdf_smooth > 0:
+            if lambda_sdf_smooth > 0:
                 loss_sdf_smooth = sdf_smoothness_loss(
                     fc_params['sdf'], grid_edges,
                     mode=sdf_smooth_mode,
                     threshold=sdf_smooth_threshold,
                 )
-                total_loss = total_loss + current_lambda_sdf_smooth * loss_sdf_smooth
+                total_loss = total_loss + lambda_sdf_smooth * loss_sdf_smooth
                 loss_dict['SDF_Smooth'] = loss_sdf_smooth.item()
 
             # SDF 二阶平滑损失
