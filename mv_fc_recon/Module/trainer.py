@@ -73,13 +73,22 @@ class Trainer(object):
         # 渲染权重（主要驱动力，引导网格变化）
         lambda_render: float = 1.0,         # 渲染损失权重
         lambda_thin_plate_energy: float = 0.5,  ## 1e-6
+        # # FlexiCubes 专用正则化（推荐使用）
+        # lambda_sdf_smooth: float = 0.1,     # SDF 平滑：惩罚相邻网格点 SDF 差异
+        # lambda_sdf_grad_smooth: float = 0.01,  # SDF 二阶平滑：惩罚梯度变化（更好保持细节）
+        # lambda_weight_reg: float = 0.01,    # 权重正则化：约束 alpha/beta/gamma
+        # lambda_mesh_smooth: float = 0.0,    # 网格 Laplacian 平滑（可选）
+        # lambda_normal_consistency: float = 0.01,  # 法线一致性（可选）
+        # lambda_dev: float = 0.1,            # FlexiCubes 可展性正则化
+
         # FlexiCubes 专用正则化（推荐使用）
-        lambda_sdf_smooth: float = 0.1,     # SDF 平滑：惩罚相邻网格点 SDF 差异
-        lambda_sdf_grad_smooth: float = 0.01,  # SDF 二阶平滑：惩罚梯度变化（更好保持细节）
-        lambda_weight_reg: float = 0.01,    # 权重正则化：约束 alpha/beta/gamma
+        lambda_sdf_smooth: float = 0.0,     # SDF 平滑：惩罚相邻网格点 SDF 差异
+        lambda_sdf_grad_smooth: float = 0.0,  # SDF 二阶平滑：惩罚梯度变化（更好保持细节）
+        lambda_weight_reg: float = 0.0,    # 权重正则化：约束 alpha/beta/gamma
         lambda_mesh_smooth: float = 0.0,    # 网格 Laplacian 平滑（可选）
-        lambda_normal_consistency: float = 0.01,  # 法线一致性（可选）
-        lambda_dev: float = 0.1,            # FlexiCubes 可展性正则化
+        lambda_normal_consistency: float = 0.0,  # 法线一致性（可选）
+        lambda_dev: float = 0.0,            # FlexiCubes 可展性正则化
+
         # SDF 平滑参数
         sdf_smooth_mode: str = 'l2',  # 'l2', 'adaptive', 'huber' (推荐 'l2'，adaptive 可能信号太少)
         sdf_smooth_threshold: float = 0,  # adaptive/huber 模式的阈值
@@ -126,6 +135,8 @@ class Trainer(object):
             拟合后的 mesh
         """
         # 创建 FlexiCubes 参数
+
+        
         fc_params = FCConvertor.createFC(mesh, resolution, device)
         if fc_params is None:
             return None
@@ -166,7 +177,14 @@ class Trainer(object):
             optimizer.zero_grad()
 
             # 从 FlexiCubes 参数提取 mesh
-            current_mesh, vertices, L_dev = FCConvertor.extractMesh(fc_params, training=True)
+            current_mesh, vertices, L_dev = FCConvertor.extractMesh(fc_params, training=True) 
+
+            if iteration == 0: 
+                with torch.no_grad():
+                    V0 = torch.from_numpy(current_mesh.vertices).float().to(device) 
+                    F0 = torch.from_numpy(current_mesh.faces).long().to(device) 
+                    E_thinplate_base = thin_plate_energy(V0, F0) 
+                E_thinplate_base = E_thinplate_base.detach() 
 
             # 检查网格有效性
             if current_mesh is None or len(current_mesh.vertices) == 0 or len(current_mesh.faces) == 0:
@@ -222,7 +240,7 @@ class Trainer(object):
             ## thin-plate energy（缩放到与 render 成固定比例，作为稳定辅助 loss）
             if lambda_thin_plate_energy > 0:
                 thinplate_loss = thin_plate_energy(
-                    vertices, faces_tensor
+                    vertices, faces_tensor, factor=E_thinplate_base
                 )
                 if lambda_render > 0 and avg_render_loss.numel() > 0:
                     # 目标贡献 = lambda_thin_plate_energy/(lambda_render+lambda_thin_plate_energy)*avg_render_loss
