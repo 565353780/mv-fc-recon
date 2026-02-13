@@ -13,11 +13,11 @@ from flexi_cubes.Module.fc_convertor import FCConvertor
 from mv_fc_recon.Loss.flexicubes_reg import (
     sdf_smoothness_loss,
     sdf_gradient_smoothness_loss,
-    weight_regularization_loss,
+    weight_regularization_loss, 
     mesh_normal_consistency_loss,
-    mesh_bi_laplacian_smoothness_loss,
+    sdf_reg_loss,
 )
-from mv_fc_recon.Loss.mesh_geo_energy import thin_plate_energy
+from mv_fc_recon.Loss.mesh_geo_energy import thin_plate_energy, edge_len_loss
 
 
 class Trainer(object):
@@ -72,64 +72,15 @@ class Trainer(object):
         lr: float = 5e-4,
         # 渲染权重（主要驱动力，引导网格变化）
         lambda_render: float = 1.0,         # 渲染损失权重
-        lambda_thin_plate_energy: float = 0.5,  ## 1e-6
-        # # FlexiCubes 专用正则化（推荐使用）
-        # lambda_sdf_smooth: float = 0.1,     # SDF 平滑：惩罚相邻网格点 SDF 差异
-        # lambda_sdf_grad_smooth: float = 0.01,  # SDF 二阶平滑：惩罚梯度变化（更好保持细节）
-        # lambda_weight_reg: float = 0.01,    # 权重正则化：约束 alpha/beta/gamma
-        # lambda_mesh_smooth: float = 0.0,    # 网格 Laplacian 平滑（可选）
-        # lambda_normal_consistency: float = 0.01,  # 法线一致性（可选）
-        # lambda_dev: float = 0.1,            # FlexiCubes 可展性正则化
+        lambda_thin_plate_energy: float = 1e-2,  # 5e-3 
+        lambda_reg: float = 0.2,            # FlexiCubes equation(8)&(9) 正则化
+        # lambda_edgelen: float = 1e4, 
 
-        # FlexiCubes 专用正则化（推荐使用）
-        lambda_sdf_smooth: float = 0.0,     # SDF 平滑：惩罚相邻网格点 SDF 差异
-        lambda_sdf_grad_smooth: float = 0.0,  # SDF 二阶平滑：惩罚梯度变化（更好保持细节）
-        lambda_weight_reg: float = 0.0,    # 权重正则化：约束 alpha/beta/gamma
-        lambda_mesh_smooth: float = 0.0,    # 网格 Laplacian 平滑（可选）
-        lambda_normal_consistency: float = 0.0,  # 法线一致性（可选）
-        lambda_dev: float = 0.0,            # FlexiCubes 可展性正则化
-
-        # SDF 平滑参数
-        sdf_smooth_mode: str = 'l2',  # 'l2', 'adaptive', 'huber' (推荐 'l2'，adaptive 可能信号太少)
-        sdf_smooth_threshold: float = 0,  # adaptive/huber 模式的阈值
         # 其他参数
         log_interval: int = 10,
         log_dir: str = './output/',
     ) -> trimesh.Trimesh:
         """通过多视角图像拟合 FlexiCubes 参数
-
-        ⚠️ 重要说明：FlexiCubes 的 SDF 与传统 SDF（NeuS、NeuralAngelo）有本质区别！
-        FlexiCubes 的 SDF 特点：
-        1. 只需要符号正确（正=外部，负=内部），不需要是真正的距离场
-        2. SDF 值的尺度是任意的，不需要满足 ||∇SDF|| = 1
-        3. 表面位置由 SDF 零交叉点决定，而非 SDF 值本身
-
-        SDF 平滑模式说明：
-        - 'l2': 简单 L2 平滑，惩罚所有 SDF 差异
-        - 'adaptive': 自适应平滑，只惩罚超过阈值的差异（推荐）
-        - 'huber': Huber loss，对大差异使用 L1，小差异使用 L2
-
-        Args:
-            camera_list: 相机列表
-            mesh: 初始网格（可选），如果为 None 则随机初始化
-            resolution: FlexiCubes 分辨率
-            device: 计算设备
-            bg_color: 背景颜色
-            num_iterations: 迭代次数
-            lr: 学习率
-            lambda_render: 渲染损失权重（主要驱动力）
-            lambda_sdf_smooth: SDF 平滑权重（推荐 0.1-0.5）
-            lambda_sdf_grad_smooth: SDF 二阶平滑权重（推荐 0.0-0.1，用于保持细节）
-            lambda_weight_reg: 权重正则化权重（推荐 0.01-0.1）
-            lambda_mesh_smooth: 网格 Laplacian 平滑权重（可选，推荐 0.0-0.1）
-            lambda_normal_consistency: 法线一致性权重（可选，推荐 0.0-0.1）
-            lambda_dev: FlexiCubes developability 正则化权重
-            sdf_smooth_mode: SDF 平滑模式 ('l2', 'adaptive', 'huber')
-            sdf_smooth_threshold: adaptive/huber 模式的阈值
-            sdf_smooth_warmup: 动态调整的 warmup 迭代数
-            sdf_smooth_scale: 动态调整的最大缩放因子
-            log_interval: 日志打印间隔
-            log_dir: TensorBoard 日志目录
 
         Returns:
             拟合后的 mesh
@@ -153,6 +104,8 @@ class Trainer(object):
 
         # 获取 grid_edges 用于 SDF 正则化
         grid_edges = fc_params['grid_edges']
+        
+
 
         # 创建 TensorBoard writer
         writer = None
@@ -164,7 +117,7 @@ class Trainer(object):
 
         if log_dir:
             with torch.no_grad():
-                curr_mesh, _, _ = FCConvertor.extractMesh(fc_params, training=False)
+                curr_mesh, _, _, _= FCConvertor.extractMesh(fc_params, training=False)
                 if curr_mesh is not None and len(curr_mesh.vertices) > 0 and len(curr_mesh.faces) > 0:
                     try:
                         curr_mesh.export(log_dir + 'start_fc_mesh.ply')
@@ -177,7 +130,7 @@ class Trainer(object):
             optimizer.zero_grad()
 
             # 从 FlexiCubes 参数提取 mesh
-            current_mesh, vertices, L_dev = FCConvertor.extractMesh(fc_params, training=True) 
+            current_mesh, vertices, L_dev, sdf = FCConvertor.extractMesh(fc_params, training=True) 
 
             if iteration == 0: 
                 with torch.no_grad():
@@ -231,72 +184,55 @@ class Trainer(object):
 
                 avg_render_loss = total_render_loss / len(batch_indices)
 
+                # print("renderloss: ", avg_render_loss)
+
                 total_loss = total_loss + lambda_render * avg_render_loss
                 loss_dict['Render'] = avg_render_loss.item()
 
-            # FlexiCubes developability 正则化损失
-            loss_dev = L_dev.mean() if L_dev is not None and L_dev.numel() > 0 else torch.tensor(0.0, device=device)
 
             ## thin-plate energy（缩放到与 render 成固定比例，作为稳定辅助 loss）
             if lambda_thin_plate_energy > 0:
                 thinplate_loss = thin_plate_energy(
                     vertices, faces_tensor, factor=E_thinplate_base
                 )
-                if lambda_render > 0 and avg_render_loss.numel() > 0:
-                    # 目标贡献 = lambda_thin_plate_energy/(lambda_render+lambda_thin_plate_energy)*avg_render_loss
-                    # 缩放因子计算全部无梯度，梯度只从 thinplate_loss 反传
-                    target_contribution = (lambda_thin_plate_energy / (lambda_render + lambda_thin_plate_energy)) * avg_render_loss.detach()
-                    scale = target_contribution / (thinplate_loss.detach() + 1e-8)
-                    scaled_thinplate = scale.detach() * thinplate_loss
-                    total_loss = total_loss + scaled_thinplate
-                else:
-                    total_loss = total_loss + lambda_thin_plate_energy * thinplate_loss
+                # print("thin plate: ", thinplate_loss)
+                # if lambda_render > 0 and avg_render_loss.numel() > 0:
+                #     # 目标贡献 = lambda_thin_plate_energy/(lambda_render+lambda_thin_plate_energy)*avg_render_loss
+                #     # 缩放因子计算全部无梯度，梯度只从 thinplate_loss 反传
+                #     target_contribution = (lambda_thin_plate_energy / (lambda_render + lambda_thin_plate_energy)) * avg_render_loss.detach()
+                #     scale = target_contribution / (thinplate_loss.detach() + 1e-8)
+                #     scaled_thinplate = scale.detach() * thinplate_loss
+                #     total_loss = total_loss + scaled_thinplate
+
+                #     print("thin plate: ", thinplate_loss, " scaled: ", scaled_thinplate) 
+                # else:
+                total_loss = total_loss + lambda_thin_plate_energy * thinplate_loss
+                # print("thin plate: ", thinplate_loss, " scaled: ", lambda_thin_plate_energy * thinplate_loss ) 
                 loss_dict['thinPlateE'] = thinplate_loss.item()
 
-            # FlexiCubes developability
-            if lambda_dev > 0:
-                total_loss = total_loss + lambda_dev * loss_dev
-                loss_dict['Dev'] = loss_dev.item()
 
-            # SDF 平滑损失
-            if lambda_sdf_smooth > 0:
-                loss_sdf_smooth = sdf_smoothness_loss(
-                    fc_params['sdf'], grid_edges,
-                    mode=sdf_smooth_mode,
-                    threshold=sdf_smooth_threshold,
-                )
-                total_loss = total_loss + lambda_sdf_smooth * loss_sdf_smooth
-                loss_dict['SDF_Smooth'] = loss_sdf_smooth.item()
+            # FlexiCubes regularizers 
+            if lambda_reg > 0: 
+                ## copied from flexicube examples. 
+                t_iter = iteration / num_iterations 
+                sdf_weight = lambda_reg - (lambda_reg - lambda_reg/20)*min(1.0, 4.0 * t_iter)
 
-            # SDF 二阶平滑损失
-            if lambda_sdf_grad_smooth > 0:
-                loss_sdf_grad_smooth = sdf_gradient_smoothness_loss(
-                    fc_params['sdf'], grid_edges, fc_params['x_nx3'],
-                    mode='local',
-                )
-                total_loss = total_loss + lambda_sdf_grad_smooth * loss_sdf_grad_smooth
-                loss_dict['SDF_Grad_Smooth'] = loss_sdf_grad_smooth.item()
+                reg_loss = sdf_reg_loss(sdf, grid_edges).mean() * sdf_weight
+                reg_loss = reg_loss + L_dev.mean() * 0.5 
 
-            # 权重正则化损失
-            if lambda_weight_reg > 0:
-                loss_weight_reg = weight_regularization_loss(fc_params['weight'])
-                total_loss = total_loss + lambda_weight_reg * loss_weight_reg
-                loss_dict['Weight_Reg'] = loss_weight_reg.item()
+                weight = fc_params['weight'] 
+                reg_loss = reg_loss + (weight[:,:20]).abs().mean() * 0.1 
 
-            # 网格 Laplacian 平滑损失
-            # 不如优化图像上 当前渲染的normal map rgb图的光滑程度？
-            if lambda_mesh_smooth > 0 and iteration >= 200 :
-                loss_mesh_smooth = mesh_bi_laplacian_smoothness_loss(vertices, faces_tensor)
-                total_loss = total_loss + lambda_mesh_smooth * loss_mesh_smooth
-                loss_dict['Mesh_Smooth'] = loss_mesh_smooth.item()
+                loss_dict['Reg'] = reg_loss.item() 
+                total_loss = total_loss + reg_loss 
+            
 
-                print("laplace loss: ", loss_mesh_smooth)
+            # if lambda_edgelen > 0: 
+            #     loss_edgelen = edge_len_loss(vertices, faces_tensor) 
+            #     total_loss = total_loss + lambda_edgelen * loss_edgelen
+            #     loss_dict['EdgeLen'] = loss_edgelen.item()
 
-            # 法线一致性损失
-            if lambda_normal_consistency > 0:
-                loss_normal_consistency = mesh_normal_consistency_loss(vertices, faces_tensor)
-                total_loss = total_loss + lambda_normal_consistency * loss_normal_consistency
-                loss_dict['Normal_Consistency'] = loss_normal_consistency.item()
+
 
             # 检查损失是否包含 NaN 或 Inf
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -360,12 +296,11 @@ class Trainer(object):
             postfix_dict = {'loss': f'{total_loss.item():.4f}'}
             if 'Render' in loss_dict:
                 postfix_dict['render'] = f'{loss_dict["Render"]:.4f}'
-            if 'SDF_Smooth' in loss_dict:
-                postfix_dict['sdf_sm'] = f'{loss_dict["SDF_Smooth"]:.6f}'
-            if 'Dev' in loss_dict:
-                postfix_dict['dev'] = f'{loss_dict["Dev"]:.6f}'
-            if 'Normal_Consistency' in loss_dict:
-                postfix_dict['normal'] = f'{loss_dict["Normal_Consistency"]:.6f}'
+            if 'Reg' in loss_dict:
+                postfix_dict['reg'] = f'{loss_dict["Reg"]:.6f}' 
+            if 'EdgeLen' in loss_dict: 
+                postfix_dict['elen'] = f'{loss_dict["EdgeLen"]:.6f}' 
+
             pbar.set_postfix(postfix_dict)
 
         # 关闭 TensorBoard writer
@@ -373,6 +308,6 @@ class Trainer(object):
             writer.close()
 
         # 提取最终 mesh
-        final_mesh, _, _ = FCConvertor.extractMesh(fc_params, training=False)
+        final_mesh, _, _, _ = FCConvertor.extractMesh(fc_params, training=False)
 
         return final_mesh

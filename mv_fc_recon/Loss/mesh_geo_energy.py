@@ -30,90 +30,7 @@ def angle_safe(u: torch.Tensor, v: torch.Tensor, eps: float = 1e-12):
         
     theta = 2.0 * torch.atan(num / denom)
     return theta
-    
-
-def thin_plate_energy_backup(
-    V: torch.Tensor,
-    F: torch.Tensor,
-    with_gauss: bool = True,
-):
-    """
-    离散 thin-plate 能量（矩阵自由、梯度完整、数值稳定）:
-        E = ||M L V||^2 - 2 * sum_i (2*pi - sum_j theta_j)
-
-    V: [n, 3]，需 requires_grad=True
-    F: [m, 3] long
-    with_gauss: 是否包含高斯曲率项
-    """
-    n = V.shape[0]
-
-    v0 = V[F[:, 0]]
-    v1 = V[F[:, 1]]
-    v2 = V[F[:, 2]]
-
-    e0 = v1 - v2
-    e1 = v2 - v0
-    e2 = v0 - v1
-
-    l2_0 = (e0 * e0).sum(dim=1)
-    l2_1 = (e1 * e1).sum(dim=1)
-    l2_2 = (e2 * e2).sum(dim=1)
-
-    dblA = torch.norm(torch.cross(v1 - v0, v2 - v0, dim=1), dim=1)
-    dblA = torch.clamp(dblA, min=_EPS_AREA)
-
-    cot0 = (l2_1 + l2_2 - l2_0) / dblA * 0.25
-    cot1 = (l2_2 + l2_0 - l2_1) / dblA * 0.25
-    cot2 = (l2_0 + l2_1 - l2_2) / dblA * 0.25
-    cot0 = torch.clamp(cot0, min=_COT_MIN, max=_COT_MAX)
-    cot1 = torch.clamp(cot1, min=_COT_MIN, max=_COT_MAX)
-    cot2 = torch.clamp(cot2, min=_COT_MIN, max=_COT_MAX)
-
-    # 矩阵自由 Laplacian：非原地 index_add 链式累加，保证梯度完整
-    LV = torch.zeros_like(V)
-    w0 = cot0.unsqueeze(1)
-    LV = LV.index_add_(0, F[:, 1], w0 * (v1 - v2))
-    LV = LV.index_add_(0, F[:, 2], w0 * (v2 - v1))
-    w1 = cot1.unsqueeze(1)
-    LV = LV.index_add_(0, F[:, 2], w1 * (v2 - v0))
-    LV = LV.index_add_(0, F[:, 0], w1 * (v0 - v2))
-    w2 = cot2.unsqueeze(1)
-    LV = LV.index_add_(0, F[:, 0], w2 * (v0 - v1))
-    LV = LV.index_add_(0, F[:, 1], w2 * (v1 - v0))
-
-    one_third_area = dblA / 6.0 
-
-
-    A = (
-        torch.zeros(n, device=V.device, dtype=V.dtype).index_add_(0, F[:, 0], one_third_area)
-        + torch.zeros(n, device=V.device, dtype=V.dtype).index_add_(0, F[:, 1], one_third_area)
-        + torch.zeros(n, device=V.device, dtype=V.dtype).index_add_(0, F[:, 2], one_third_area)
-    )
-    A = torch.clamp(A, min=_EPS_AREA)
-    inv_sqrt_A = torch.rsqrt(A + _EPS_DENOM)
-
-    LV = LV * inv_sqrt_A.unsqueeze(1)
-    E_mean = (LV * LV).sum()
-
-    if not with_gauss:
-        return E_mean
-
-    a0 = angle_safe(v1 - v0, v2 - v0, _EPS_ACOS)
-    a1 = angle_safe(v2 - v1, v0 - v1, _EPS_ACOS)
-    a2 = angle_safe(v0 - v2, v1 - v2, _EPS_ACOS)
-
-    angle_sum = (
-        torch.zeros(n, device=V.device, dtype=V.dtype).index_add_(0, F[:, 0], a0)
-        + torch.zeros(n, device=V.device, dtype=V.dtype).index_add_(0, F[:, 1], a1)
-        + torch.zeros(n, device=V.device, dtype=V.dtype).index_add_(0, F[:, 2], a2)
-    )
-    K = 2.0 * torch.pi - angle_sum
-    E_gauss = -2.0 * K.sum()
-    print("test: ", E_mean.item(), " ", E_gauss.item(), " ", E_mean.item()+  E_gauss.item()),  
-
-    return (E_mean + E_gauss)
-    # return (E_mean + E_gauss) / V.shape[0] 
-
+   
 
 
 
@@ -202,6 +119,36 @@ def thin_plate_energy(
 
     # print("[test] ", E_tot.item() )
     return E_tot 
+
+
+
+def edge_len_loss(
+    V: torch.Tensor,
+    F: torch.Tensor,
+    eps: float = 1e-12,
+):
+
+    v0 = V[F[:, 0]]
+    v1 = V[F[:, 1]]
+    v2 = V[F[:, 2]]
+
+    e0 = v1 - v2
+    e1 = v2 - v0
+    e2 = v0 - v1
+
+    l0 = torch.sqrt((e0 * e0).sum(dim=1) + eps)
+    l1 = torch.sqrt((e1 * e1).sum(dim=1) + eps)
+    l2 = torch.sqrt((e2 * e2).sum(dim=1) + eps)
+
+    lengths = torch.cat([l0, l1, l2], dim=0)
+
+    # 全局平均边长
+    mean_len = lengths.mean()
+
+    # 方差
+    loss = ((lengths - mean_len) ** 2).mean()
+
+    return loss
 
 
 

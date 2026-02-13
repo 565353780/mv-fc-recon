@@ -3,7 +3,7 @@ sys.path.append('../camera-control')
 sys.path.append('../flexi-cubes')
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '4'
 import pickle
 
 from camera_control.Method.io import loadMeshFile
@@ -16,9 +16,9 @@ from mv_fc_recon.Module.trainer import Trainer
 
 def demo():
     # 小妖怪头
-    shape_id = "003fe719725150960b14cdd6644afe5533743ef63d3767c495ab76a6384a9b2f"
+    # shape_id = "003fe719725150960b14cdd6644afe5533743ef63d3767c495ab76a6384a9b2f"
     # 女人上半身
-    shape_id = "017c6e8b81a17c298baf2aba24fd62fa5a992ba8346bc86b2b5008caf1478873"
+    # shape_id = "017c6e8b81a17c298baf2aba24fd62fa5a992ba8346bc86b2b5008caf1478873"
     # 长发男人头
     shape_id = "0228c5cdba8393cd4d947ac2e915f769f684c73b87e6939c129611ba665cafcb"
 
@@ -41,7 +41,7 @@ def demo():
 
         camera_list = MeshRenderer.sampleRenderData(
             mesh,
-            camera_num=20,
+            camera_num=50,
             camera_dist=1.6,
             width=1024,
             height=1024,
@@ -65,12 +65,14 @@ def demo():
     fitting_mesh = Trainer.fitImagesWithSDFLoss(
         camera_list=camera_list,
         mesh=mesh,
-        resolution=128,
+        resolution=192,
         device=device,
         num_iterations=200,
         log_interval=5,
         log_dir=log_dir,
     )
 
-    fitting_mesh.export(log_dir + 'fc_fitting_mesh.ply')
+    # fitting_mesh.export(log_dir + 'fc_fitting_mesh.ply')
+    fitting_mesh.export( shape_id + '_fc_fitting_mesh.ply')
+    print("[result] ", shape_id + '_fc_fitting_mesh.ply') 
     return True

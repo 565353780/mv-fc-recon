@@ -1,6 +1,17 @@
 import torch
 
 
+def sdf_reg_loss(sdf, all_edges):
+    sdf_f1x6x2 = sdf[all_edges.reshape(-1)].reshape(-1,2)
+    mask = torch.sign(sdf_f1x6x2[...,0]) != torch.sign(sdf_f1x6x2[...,1])
+    sdf_f1x6x2 = sdf_f1x6x2[mask]
+    sdf_diff = torch.nn.functional.binary_cross_entropy_with_logits(sdf_f1x6x2[...,0], (sdf_f1x6x2[...,1] > 0).float()) + \
+            torch.nn.functional.binary_cross_entropy_with_logits(sdf_f1x6x2[...,1], (sdf_f1x6x2[...,0] > 0).float())
+    return sdf_diff
+
+
+
+
 def sdf_smoothness_loss(
     sdf: torch.Tensor,
     grid_edges: torch.Tensor,
@@ -210,125 +221,6 @@ def weight_regularization_loss(
     loss_gamma = (gamma ** 2).mean()
 
     return loss_beta + loss_alpha + loss_gamma
-
-
-def mesh_laplacian_smoothness_loss(
-    vertices: torch.Tensor,
-    faces: torch.Tensor,
-) -> torch.Tensor:
-    """网格 Laplacian 平滑损失
-
-    直接在提取的网格顶点上计算 Laplacian 平滑，
-    这比在 SDF 上计算曲率更直接有效。
-
-    Args:
-        vertices: [V, 3] 网格顶点
-        faces: [F, 3] 网格面片
-
-    Returns:
-        loss: Laplacian 平滑损失
-    """
-    device = vertices.device
-    num_vertices = vertices.shape[0]
-
-    # 构建邻接关系
-    # 从面片中提取边
-    edges = torch.cat([
-        faces[:, [0, 1]],
-        faces[:, [1, 2]],
-        faces[:, [2, 0]],
-    ], dim=0)  # [3F, 2]
-
-    # 去重并创建双向边
-    edges = torch.cat([edges, edges.flip(1)], dim=0)  # [6F, 2]
-    edges = torch.unique(edges, dim=0)  # [E', 2]
-
-    # 计算每个顶点的邻居均值
-    # 使用 scatter_add 来累加邻居位置
-    neighbor_sum = torch.zeros_like(vertices)  # [V, 3]
-    neighbor_count = torch.zeros(num_vertices, device=device)  # [V]
-
-    src_idx = edges[:, 0]  # [E']
-    dst_idx = edges[:, 1]  # [E']
-
-    # 累加邻居位置
-    neighbor_sum.scatter_add_(0, dst_idx.unsqueeze(1).expand(-1, 3), vertices[src_idx])
-    neighbor_count.scatter_add_(0, dst_idx, torch.ones(len(dst_idx), device=device))
-
-    # 避免除以 0
-    neighbor_count = neighbor_count.clamp(min=1)
-
-    # 邻居均值
-    neighbor_mean = neighbor_sum / neighbor_count.unsqueeze(1)  # [V, 3]
-
-    # Laplacian = 顶点位置 - 邻居均值
-    laplacian = vertices - neighbor_mean  # [V, 3]
-
-    # L2 损失
-    loss = (laplacian ** 2).sum(dim=-1).mean()
-
-    return loss
-
-
-
-def mesh_bi_laplacian_smoothness_loss(
-    vertices: torch.Tensor,
-    faces: torch.Tensor,
-) -> torch.Tensor:
-    """
-    网格 Bi-Laplacian（薄板能量）平滑损失
-
-    说明：
-        - 先计算 Laplacian: Δv_i = v_i - mean(N(v_i))
-        - 再对 Laplacian 再计算 Laplacian
-        - 最终 L2 norm 平均，抑制顶点高频毛刺 / 曲率震荡
-        - 对顶点可导，适合直接训练
-
-    Args:
-        vertices: [V, 3] 顶点
-        faces: [F, 3] 面片索引
-
-    Returns:
-        loss: bi-Laplacian 平滑损失
-    """
-    device = vertices.device
-    num_vertices = vertices.shape[0]
-
-    # 构建邻接关系
-    edges = torch.cat([
-        faces[:, [0, 1]],
-        faces[:, [1, 2]],
-        faces[:, [2, 0]],
-    ], dim=0)  # [3F, 2]
-
-    # 双向 + 去重
-    edges = torch.cat([edges, edges.flip(1)], dim=0)
-    edges = torch.unique(edges, dim=0)
-
-    src_idx = edges[:, 0]
-    dst_idx = edges[:, 1]
-
-    # ---------- 定义一个内部函数：一次 Laplacian ----------
-    def laplacian(v):
-        neighbor_sum = torch.zeros_like(v)
-        neighbor_count = torch.zeros(num_vertices, device=device)
-        neighbor_sum.scatter_add_(0, dst_idx.unsqueeze(1).expand(-1, 3), v[src_idx])
-        neighbor_count.scatter_add_(0, dst_idx, torch.ones(len(dst_idx), device=device))
-        neighbor_count = neighbor_count.clamp(min=1)
-        neighbor_mean = neighbor_sum / neighbor_count.unsqueeze(1)
-        return v - neighbor_mean
-
-    # 一阶 Laplacian
-    lap1 = laplacian(vertices)
-
-    # 二阶 Laplacian
-    lap2 = laplacian(lap1)
-
-    # L2 loss
-    loss = (lap2 ** 2).sum(dim=-1).mean()
-
-    return loss
-
 
 
 
