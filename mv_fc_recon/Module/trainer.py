@@ -83,6 +83,7 @@ class Trainer(object):
         # 其他参数
         log_interval: int = 10,
         log_dir: str = './output/',
+        log_image_num: int=4,
     ) -> trimesh.Trimesh:
         """通过多视角图像拟合 FlexiCubes 参数
 
@@ -91,7 +92,6 @@ class Trainer(object):
         """
         # 创建 FlexiCubes 参数
 
-        
         fc_params = FCConvertor.createFC(mesh, resolution, device)
         if fc_params is None:
             return None
@@ -108,8 +108,6 @@ class Trainer(object):
 
         # 获取 grid_edges 用于 SDF 正则化
         grid_edges = fc_params['grid_edges']
-        
-
 
         # 创建 TensorBoard writer
         writer = None
@@ -117,11 +115,14 @@ class Trainer(object):
             os.makedirs(log_dir, exist_ok=True)
             writer = SummaryWriter(log_dir=log_dir)
             for i, target_data in enumerate(target_data_list):
+                if i >= log_image_num:
+                    break
+
                 writer.add_image(f'GT/Camera_{i}', target_data.clone().permute(2, 0, 1), global_step=0)
 
         if log_dir:
             with torch.no_grad():
-                curr_mesh, _, _, _= FCConvertor.extractMesh(fc_params, training=True)
+                curr_mesh, _, _, _ = FCConvertor.extractMesh(fc_params, training=True)
                 if curr_mesh is not None and len(curr_mesh.vertices) > 0 and len(curr_mesh.faces) > 0:
                     try:
                         curr_mesh.export(log_dir + 'start_fc_mesh.ply')
@@ -177,9 +178,9 @@ class Trainer(object):
                         bg_color=bg_color,
                         vertices_tensor=vertices,
                     )
-                    render_data = render_dict['normal_camera']
+                    render_data = render_dict['world']
 
-                    if len(render_data_list) < 4:
+                    if len(render_data_list) < log_image_num:
                         render_data_list.append(render_data.clone())
                         render_idx_list.append(idx)
 
@@ -192,7 +193,6 @@ class Trainer(object):
 
                 total_loss = total_loss + lambda_render * avg_render_loss
                 loss_dict['Render'] = avg_render_loss.item()
-
 
             ## thin-plate energy（缩放到与 render 成固定比例，作为稳定辅助 loss）
             if lambda_thin_plate_energy > 0:
@@ -229,7 +229,6 @@ class Trainer(object):
 
                 loss_dict['Reg'] = reg_loss.item() 
                 total_loss = total_loss + reg_loss 
-            
 
             if lambda_smooth > 0: 
                 # loss_normal = mesh_normal_consistency_loss(vertices, faces_tensor)
@@ -239,14 +238,10 @@ class Trainer(object):
                 total_loss = total_loss + lambda_smooth * loss_hessian
                 loss_dict['LN'] = loss_hessian.item() 
 
-                
-
             # if lambda_edgelen > 0: 
             #     loss_edgelen = short_edge_loss(vertices, faces_tensor) 
             #     total_loss = total_loss + lambda_edgelen * loss_edgelen
             #     loss_dict['EdgeLen'] = loss_edgelen.item()
-
-
 
             # 检查损失是否包含 NaN 或 Inf
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -303,7 +298,7 @@ class Trainer(object):
                     # 记录渲染图像
                     for i, (render_data, render_idx) in enumerate(zip(render_data_list, render_idx_list)):
                         if render_data.dim() == 3 and render_data.shape[-1] == 3:
-                            render_data = render_data.permute(2, 0, 1)
+                            render_data = render_data.permute(2, 0, 1) * 0.5 + 0.5
                         writer.add_image(f'Render/Camera_{render_idx}', render_data, global_step=iteration)
 
             # 更新进度条（只显示实际使用的 loss）
